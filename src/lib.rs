@@ -1,3 +1,20 @@
+//! A collection of lazy initialized values that are created by `Future`s.
+//!
+//! [OnceCell]'s API should be familiar to anyone who has used the
+//! [`once_cell`](https://crates.io/crates/once_cell) crate or the proposed `std::lazy` module.  It
+//! provides an async version of a cell that can only be initialized once, permitting tasks to wait
+//! on the initialization if it is already running instead of racing multiple initialization tasks.
+//!
+//! Unlike threads, tasks can be cancelled at any point where they block.  [OnceCell] deals with
+//! this by allowing another initializer to run if the task currently initializing the cell is
+//! dropped.  This also allows for fallible initialization using [OnceCell::get_or_try_init], and
+//! for the initializing `Future` to contain borrows or use references thread-local data.
+//!
+//! [OnceFuture] and its wrappers [Lazy] and [ConstLazy] take the opposite approach: they wrap a
+//! single `Future` which is cooperatively run to completion by any polling task.  This requires
+//! that the initialization function be independent of the calling context, but will never restart
+//! an initializing function just because the surrounding task was cancelled.
+
 use std::{
     cell::UnsafeCell,
     convert::Infallible,
@@ -11,9 +28,11 @@ use std::{
     task,
 };
 
-/// A thread-safe cell which can be written to only once.
+/// A cell which can be written to only once.
 ///
-/// This allows initialization using an async closure which is guaranteed to only be called once.
+/// This allows initialization using an async closure that borrows from its environment.
+///
+/// Unlike [OnceFuture], the initialing closures do not require `Send + 'static` bounds.
 #[derive(Debug)]
 pub struct OnceCell<T> {
     value: UnsafeCell<Option<T>>,
@@ -22,7 +41,7 @@ pub struct OnceCell<T> {
 
 unsafe impl<T: Sync + Send> Sync for OnceCell<T> {}
 unsafe impl<T: Send> Send for OnceCell<T> {}
-
+impl<T> Unpin for OnceCell<T> {}
 impl<T: RefUnwindSafe + UnwindSafe> RefUnwindSafe for OnceCell<T> {}
 impl<T: UnwindSafe> UnwindSafe for OnceCell<T> {}
 
@@ -284,7 +303,7 @@ impl<T> OnceCell<T> {
     /// it is guaranteed that only one future will be executed as long as the resuting future is
     /// polled to completion.
     ///
-    /// If f panics, the panic is propagated to the caller, and the cell remains uninitialized.
+    /// If `init` panics, the panic is propagated to the caller, and the cell remains uninitialized.
     ///
     /// If the Future returned by this function is dropped prior to completion, the cell remains
     /// uninitialized (and another init futures may be selected for polling).
@@ -299,9 +318,10 @@ impl<T> OnceCell<T> {
     }
 
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.   If the
-    /// cell was empty and f failed, an error is returned.
+    /// cell was empty and `init` failed, an error is returned.
     ///
-    /// If f panics, the panic is propagated to the caller, and the cell remains uninitialized.
+    /// If `init` panics, the panic is propagated to the caller, and the cell remains
+    /// uninitialized.
     ///
     /// If the Future returned by this function is dropped prior to completion, the cell remains
     /// uninitialized.
@@ -382,17 +402,20 @@ impl<T> OnceCell<T> {
     }
 }
 
-/// A value which is initialized on the first access.
+/// A Future which is executed exactly once, producing an output accessible without locking.
 ///
-/// Note: unlike [OnceCell], dropping the Future that is running an unfinished initializer function
-/// will not discard the pending state.
-pub struct Lazy<T, F = Box<dyn Future<Output = T> + Send>> {
-    value: UnsafeCell<LazyState<T, F>>,
+/// This is primarily used as a building block for [Lazy] and [ConstLazy], but can be used on its
+/// own to produce more complex building blocks.
+pub struct OnceFuture<T, F = Box<dyn Future<Output = T> + Send>, I = Infallible> {
+    value: UnsafeCell<LazyState<T, I>>,
     inner: LazyInner<F>,
 }
 
-unsafe impl<T: Sync + Send, F: Send> Sync for Lazy<T, F> {}
-unsafe impl<T: Send, F: Send> Send for Lazy<T, F> {}
+unsafe impl<T: Sync + Send, F: Send, I: Send> Sync for OnceFuture<T, F, I> {}
+unsafe impl<T: Send, F: Send, I: Send> Send for OnceFuture<T, F, I> {}
+impl<T, F, I> Unpin for OnceFuture<T, F, I> {}
+impl<T: RefUnwindSafe + UnwindSafe, F, I: RefUnwindSafe> RefUnwindSafe for OnceFuture<T, F, I> {}
+impl<T: UnwindSafe, F, I: UnwindSafe> UnwindSafe for OnceFuture<T, F, I> {}
 
 enum LazyState<T, F> {
     New(F),
@@ -569,24 +592,12 @@ impl<F> task::Wake for LazyWaker<F> {
 }
 
 impl<'a, F> LazyHead<'a, F> {
-    fn set_future(&self, future: F) {
-        let ptr = self.waker.future.get();
-        unsafe {
-            *ptr = Some(future);
-        }
-    }
-
-    fn poll_inner(self) -> task::Poll<F::Output>
+    fn poll_inner(self, init: impl FnOnce() -> F) -> task::Poll<F::Output>
     where
         F: Future + Send + 'static,
     {
         let ptr = self.waker.future.get();
-        let fut = unsafe {
-            match &mut *ptr {
-                Some(fut) => Pin::new_unchecked(fut),
-                None => panic!("FutureInitializer paniced"),
-            }
-        };
+        let fut = unsafe { Pin::new_unchecked((*ptr).get_or_insert_with(init)) };
         let shared_waker = task::Waker::from(Arc::clone(self.waker));
         let mut ctx = task::Context::from_waker(&shared_waker);
         let rv = fut.poll(&mut ctx);
@@ -618,11 +629,11 @@ impl<'a, F> Drop for LazyHead<'a, F> {
     }
 }
 
-impl<T, F> Lazy<T, F> {
-    /// Creates a new lazy value with the given initializing future.
-    pub const fn new(future: F) -> Self {
-        Lazy {
-            value: UnsafeCell::new(LazyState::New(future)),
+impl<T, F, I> OnceFuture<T, F, I> {
+    /// Creates a new OnceFuture with an initializing value
+    pub const fn with_init(init: I) -> Self {
+        OnceFuture {
+            value: UnsafeCell::new(LazyState::New(init)),
             inner: LazyInner {
                 state: AtomicUsize::new(NEW),
                 queue: AtomicPtr::new(ptr::null_mut()),
@@ -631,7 +642,7 @@ impl<T, F> Lazy<T, F> {
     }
 
     /// Gets the value without blocking or starting the initialization.
-    pub fn try_get(&self) -> Option<&T> {
+    pub fn get(&self) -> Option<&T> {
         let state = self.inner.state.load(Ordering::Acquire);
         if state & READY_BIT == 0 {
             None
@@ -645,35 +656,128 @@ impl<T, F> Lazy<T, F> {
         }
     }
 
-    /// Gets the value without blocking or starting the initialization.
-    pub fn try_get_mut(&mut self) -> Option<&mut T> {
+    /// Get mutable access to the initializer or final value.
+    ///
+    /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
+    /// access and allow violating the usual rules for accessing this cell.
+    pub fn get_mut(&mut self) -> (Option<&mut I>, Option<&mut T>) {
         match self.value.get_mut() {
-            LazyState::Ready(v) => Some(v),
-            _ => None,
+            LazyState::New(i) => (Some(i), None),
+            LazyState::Running => (None, None),
+            LazyState::Ready(v) => (None, Some(v)),
         }
     }
 
-    /// Gets the value if it was set.
-    pub fn into_value(self) -> Option<T> {
+    /// Gets the initializer or final value
+    pub fn into_inner(self) -> (Option<I>, Option<T>) {
         match self.value.into_inner() {
-            LazyState::Ready(v) => Some(v),
-            _ => None,
+            LazyState::New(i) => (Some(i), None),
+            LazyState::Running => (None, None),
+            LazyState::Ready(v) => (None, Some(v)),
         }
     }
 }
 
-impl<T, F> Lazy<T, F>
+impl<T, F> OnceFuture<T, F> {
+    /// Creates a new OnceFuture without an initializing value
+    ///
+    /// The resulting Future must be produced by the closure passed to get_or_init_with
+    pub const fn new() -> Self {
+        OnceFuture {
+            value: UnsafeCell::new(LazyState::Running),
+            inner: LazyInner {
+                state: AtomicUsize::new(NEW),
+                queue: AtomicPtr::new(ptr::null_mut()),
+            },
+        }
+    }
+}
+
+impl<F> OnceFuture<F::Output, F>
+where
+    F: Future + Send + 'static,
+{
+    /// Creates a new OnceFuture directly from a Future.
+    ///
+    /// The `gen_future` or `init_future` functions will never be called.
+    pub fn from_future(future: F) -> Self {
+        let rv = Self::new();
+        let waker = rv.inner.initialize().unwrap();
+        // Safe because we currently have exclusive ownership
+        unsafe {
+            *waker.future.get() = Some(future);
+        }
+        rv
+    }
+}
+
+impl<T, F, I> OnceFuture<T, F, I>
 where
     F: Future<Output = T> + Send + 'static,
 {
-    /// Forces the evaluation of this lazy value and returns a reference to the result.  This is
-    /// equivalent to the `Future` impl on `&Lazy`, but is explicit and may be simpler to call.
-    pub async fn get(&self) -> &T {
-        self.await
+    /// Create and run the future until it produces a result, then return a reference to that
+    /// result.
+    pub async fn get_or_init_with(&self, gen_future: impl FnOnce() -> F) -> &T {
+        self.get_or_populate_with(move |_| gen_future()).await
+    }
+
+    /// Create and run the future until it produces a result, then return a reference to that
+    /// result.
+    pub fn poll_init_with(
+        &self,
+        cx: &mut task::Context<'_>,
+        gen_future: impl FnOnce() -> F,
+    ) -> task::Poll<&T> {
+        self.poll_populate(cx, move |_| gen_future())
+    }
+
+    /// Create and run the future until it produces a result, then return a reference to that
+    /// result.
+    pub async fn get_or_populate_with(&self, into_future: impl FnOnce(Option<I>) -> F) -> &T {
+        struct Get<'a, T, F, I, P>(&'a OnceFuture<T, F, I>, Option<P>);
+
+        impl<'a, T, F, I, P> Unpin for Get<'a, T, F, I, P> {}
+        impl<'a, T, F, I, P> Future for Get<'a, T, F, I, P>
+        where
+            F: Future<Output = T> + Send + 'static,
+            P: FnOnce(Option<I>) -> F,
+        {
+            type Output = &'a T;
+            fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
+                self.0.poll_populate(cx, |i| (self.1.take().unwrap())(i))
+            }
+        }
+        Get(self, Some(into_future)).await
+    }
+
+    /// Create and run the future until it produces a result, then return a reference to that
+    /// result.
+    pub fn poll_populate(
+        &self,
+        cx: &mut task::Context<'_>,
+        into_future: impl FnOnce(Option<I>) -> F,
+    ) -> task::Poll<&T> {
+        let state = self.inner.state.load(Ordering::Acquire);
+        if state & READY_BIT == 0 {
+            match self.init_slow(cx, into_future) {
+                task::Poll::Pending => return task::Poll::Pending,
+                task::Poll::Ready(()) => {}
+            }
+        }
+        unsafe {
+            match &*self.value.get() {
+                LazyState::Ready(v) => task::Poll::Ready(v),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[cold]
-    fn init_slow(&self, cx: &mut task::Context<'_>) -> task::Poll<()> {
+    fn init_slow(
+        &self,
+        cx: &mut task::Context<'_>,
+        into_future: impl FnOnce(Option<I>) -> F,
+    ) -> task::Poll<()> {
         let waker = self.inner.initialize();
         let waker = match waker {
             Some(waker) => waker,
@@ -683,15 +787,13 @@ where
         match waker.poll_head(cx, &self.inner) {
             task::Poll::Ready(Some(init_lock)) => {
                 let value = mem::replace(unsafe { &mut *self.value.get() }, LazyState::Running);
-                match value {
-                    LazyState::New(future) => {
-                        init_lock.set_future(future);
-                    }
-                    LazyState::Running => {}
+                let init = match value {
+                    LazyState::New(init) => Some(init),
+                    LazyState::Running => None,
                     LazyState::Ready(_) => unreachable!(),
-                }
+                };
 
-                match init_lock.poll_inner() {
+                match init_lock.poll_inner(move || into_future(init)) {
                     task::Poll::Ready(value) => {
                         // initialization complete
                         unsafe {
@@ -709,24 +811,115 @@ where
     }
 }
 
+/// A value which is initialized on the first access.
+///
+/// See [ConstLazy] if you need to initialize in a const context.
+pub struct Lazy<T, F = Box<dyn Future<Output = T> + Send>> {
+    once: OnceFuture<T, F>,
+}
+
+impl<T, F> Lazy<T, F> {
+    /// Gets the value without blocking or starting the initialization.
+    pub fn try_get(&self) -> Option<&T> {
+        self.once.get()
+    }
+
+    /// Gets the value without blocking or starting the initialization.
+    ///
+    /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
+    /// access and allow violating the usual rules for accessing this cell.
+    pub fn try_get_mut(&mut self) -> Option<&mut T> {
+        self.once.get_mut().1
+    }
+
+    /// Gets the value if it was set.
+    pub fn into_value(self) -> Option<T> {
+        // It would be confusing to only sometimes return the future, and it's rarely useful.
+        self.once.into_inner().1
+    }
+}
+
+impl<T, F> Lazy<T, F>
+where
+    F: Future<Output = T> + Send + 'static,
+{
+    /// Creates a new lazy value with the given initializing future.
+    pub fn new(future: F) -> Self {
+        Lazy { once: OnceFuture::from_future(future) }
+    }
+
+    /// Forces the evaluation of this lazy value and returns a reference to the result.
+    ///
+    /// This is equivalent to the `Future` impl on `&Lazy`, but is explicit and may be simpler to
+    /// call.  This will panic if the initializing closure panics or has panicked.
+    pub async fn get(&self) -> &T {
+        self.await
+    }
+}
+
 impl<'a, T, F> Future for &'a Lazy<T, F>
 where
     F: Future<Output = T> + Send + 'static,
 {
     type Output = &'a T;
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
-        let state = self.inner.state.load(Ordering::Acquire);
-        if state & READY_BIT == 0 {
-            match self.init_slow(cx) {
-                task::Poll::Pending => return task::Poll::Pending,
-                task::Poll::Ready(()) => {}
-            }
-        }
-        unsafe {
-            match &*self.value.get() {
-                LazyState::Ready(v) => task::Poll::Ready(v),
-                _ => unreachable!(),
-            }
-        }
+        self.once.poll_populate(cx, |_| panic!("Polled after initializer panicked"))
+    }
+}
+
+/// A value which is initialized on the first access.
+///
+/// Note: This structure may be larger in size than [Lazy], but it does not allocate on the heap
+/// until it is first polled, so is suitable for initializing statics.
+pub struct ConstLazy<T, F> {
+    once: OnceFuture<T, F, F>,
+}
+
+impl<T, F> ConstLazy<T, F> {
+    /// Creates a new lazy value with the given initializing future.
+    pub const fn new(future: F) -> Self {
+        ConstLazy { once: OnceFuture::with_init(future) }
+    }
+
+    /// Gets the value without blocking or starting the initialization.
+    pub fn try_get(&self) -> Option<&T> {
+        self.once.get()
+    }
+
+    /// Gets the value without blocking or starting the initialization.
+    ///
+    /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
+    /// access and allow violating the usual rules for accessing this cell.
+    pub fn try_get_mut(&mut self) -> Option<&mut T> {
+        self.once.get_mut().1
+    }
+
+    /// Gets the value if it was set.
+    pub fn into_value(self) -> Option<T> {
+        // It would be confusing to only sometimes return the future, and it's rarely useful.
+        self.once.into_inner().1
+    }
+}
+
+impl<T, F> ConstLazy<T, F>
+where
+    F: Future<Output = T> + Send + 'static,
+{
+    /// Forces the evaluation of this lazy value and returns a reference to the result.
+    ///
+    /// This is equivalent to the `Future` impl on `&ConstLazy`, but is explicit and may be simpler
+    /// to call.  This will panic if the initializing closure panics or has panicked.
+    pub async fn get(&self) -> &T {
+        self.await
+    }
+}
+
+impl<'a, T, F> Future for &'a ConstLazy<T, F>
+where
+    F: Future<Output = T> + Send + 'static,
+{
+    type Output = &'a T;
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
+        self.once.poll_populate(cx, |i| i.expect("Polled after initializer panicked").into())
     }
 }
