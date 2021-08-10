@@ -14,6 +14,12 @@
 //! single `Future` which is cooperatively run to completion by any polling task.  This requires
 //! that the initialization function be independent of the calling context, but will never restart
 //! an initializing function just because the surrounding task was cancelled.
+//!
+//! # Overhead
+//!
+//! Both cells use two `usize`s to store state and do not retain any allocations after
+//! initialization is complete.  [OnceCell] only allocates if there is contention, whereas
+//! [OnceFuture] always allocates because it must have a pinned address for running the future.
 
 use std::{
     cell::UnsafeCell,
@@ -62,6 +68,7 @@ pub struct OnceCell<T> {
     inner: Inner,
 }
 
+// Safety: our UnsafeCell should be treated like an RwLock<T>
 unsafe impl<T: Sync + Send> Sync for OnceCell<T> {}
 unsafe impl<T: Send> Send for OnceCell<T> {}
 impl<T> Unpin for OnceCell<T> {}
@@ -91,9 +98,11 @@ struct QueueRef<'a> {
     inner: &'a Inner,
     queue: *const Queue,
 }
+// Safety: the queue is a reference (only the lack of a valid lifetime requires it to be a pointer)
 unsafe impl<'a> Sync for QueueRef<'a> {}
 unsafe impl<'a> Send for QueueRef<'a> {}
 
+#[derive(Debug)]
 struct QuickInitGuard<'a>(&'a Inner);
 
 /// A Future that waits for acquisition of a QueueHead
@@ -115,19 +124,6 @@ impl Inner {
         Inner { state: AtomicUsize::new(NEW), queue: AtomicPtr::new(ptr::null_mut()) }
     }
 
-    /// Try to grab a lock without allocating.  This succeeds only if there is no contention, and
-    /// on Drop it will check for contention again.
-    #[cold]
-    fn try_quick_init(&self) -> Option<QuickInitGuard> {
-        if self.state.compare_exchange(NEW, QINIT_BIT, Ordering::Acquire, Ordering::Relaxed).is_ok()
-        {
-            // On success, this acquires a write lock on value
-            Some(QuickInitGuard(self))
-        } else {
-            None
-        }
-    }
-
     /// Initialize the queue (if needed) and return a waiter that can be polled to get a QueueHead
     /// that gives permission to initialize the OnceCell.
     ///
@@ -135,7 +131,20 @@ impl Inner {
     /// and all references have been dropped.  If any references remain, further calls to
     /// initialize will return the existing queue.
     #[cold]
-    fn initialize(&self) -> QueueWaiter {
+    fn initialize(&self, try_quick: bool) -> Result<QueueWaiter, QuickInitGuard> {
+        if try_quick {
+            if self
+                .state
+                .compare_exchange(NEW, QINIT_BIT, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                // On success, we know that there were no other QueueRef objects active, and we
+                // just set QINIT_BIT which makes us the only party allowed to create a QueueHead.
+                // This remains true even if the queue is created later.
+                return Err(QuickInitGuard(self));
+            }
+        }
+
         // Increment the queue's reference count.  This ensures that queue won't be freed until we exit.
         let prev_state = self.state.fetch_add(1, Ordering::Acquire);
 
@@ -150,14 +159,7 @@ impl Inner {
         let mut guard = QueueRef { inner: self, queue: self.queue.load(Ordering::Acquire) };
 
         if guard.queue.is_null() && prev_state & READY_BIT == 0 {
-            let wakers = if prev_state & QINIT_BIT != 0 {
-                // Someone else is taking the fast path; start with no QueueHead available.  As
-                // long as our future is pending, QuickInitGuard::drop will observe the nonzero
-                // reference count and correctly participate in the queue.
-                Mutex::new(Some(Vec::new()))
-            } else {
-                Mutex::new(None)
-            };
+            let wakers = Mutex::new(None);
 
             // Race with other callers of initialize to create the queue
             let new_queue = Box::into_raw(Box::new(Queue { wakers }));
@@ -183,7 +185,7 @@ impl Inner {
                 }
             }
         }
-        QueueWaiter { guard: Some(guard) }
+        Ok(QueueWaiter { guard: Some(guard) })
     }
 
     fn set_ready(&self) {
@@ -208,7 +210,7 @@ impl<'a> Drop for QueueRef<'a> {
             let queue = self.inner.queue.swap(ptr::null_mut(), Ordering::Acquire);
             if !queue.is_null() {
                 // Safety: the last guard is being freed, and queue is only used by guard-holders.
-                // Due to the swap, we are the only one who is freeing this particualr queue.
+                // Due to the swap, we are the only one who is freeing this particular queue.
                 unsafe {
                     Box::from_raw(queue);
                 }
@@ -219,22 +221,75 @@ impl<'a> Drop for QueueRef<'a> {
 
 impl<'a> Drop for QuickInitGuard<'a> {
     fn drop(&mut self) {
-        // Relaxed ordering is sufficient here: all decisions are made based solely on the value
-        // and timeline of the state value.  On the slow path, initialize acquires the reference as
-        // normal and so we don't need any more ordering than that already provides.
-        let prev_state = self.0.state.fetch_and(!QINIT_BIT, Ordering::Relaxed);
-        if prev_state == QINIT_BIT | READY_BIT {
-            return; // fast path, init succeeded. The Release in set_ready was sufficient.
+        let prev_state = self.0.state.load(Ordering::Relaxed);
+        if prev_state == QINIT_BIT | READY_BIT || prev_state == QINIT_BIT {
+            let target = prev_state & !QINIT_BIT;
+            // Try to finish the fast path of initialization if possible.
+            if self
+                .0
+                .state
+                .compare_exchange(prev_state, target, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // If init succeeded, the Release in set_ready already ordered the value.  If init
+                // failed, we made no writes that need to be ordered and there are no waiters to
+                // wake, so we can leave the state at NEW.
+
+                if target == READY_BIT {
+                    // It's possible (though unlikely) that someone created the queue but abandoned
+                    // their QueueRef before we finished our poll, resulting in us not observing
+                    // them.  No wakes are needed in this case because there are no waiting tasks,
+                    // but we should still clean up the allocation.
+                    let queue = self.0.queue.swap(ptr::null_mut(), Ordering::Relaxed);
+                    if !queue.is_null() {
+                        // Synchronize with both the fetch_sub that lowered the refcount and the
+                        // queue initialization.
+                        std::sync::atomic::fence(Ordering::Acquire);
+                        // Safety: we observed no active QueueRefs, and queue is only used by
+                        // guard-holders.  Due to the swap, we are the only one who is freeing this
+                        // particular queue.
+                        unsafe {
+                            Box::from_raw(queue);
+                        }
+                    }
+                }
+                return;
+            }
         }
-        if prev_state == QINIT_BIT {
-            return; // fast path, init failed.  We made no writes that need to be ordered.
+
+        // Slow path: get a guard, create the QueueHead we should have been holding, then drop it
+        // so that the tasks are woken as intended.  This is needed regardless of if we succeeded
+        // or not - either waiters need to run init themselves, or they need to read the value we
+        // set.
+        //
+        // The guard is guaranteed to have been created with no QueueHead available because
+        // QINIT_BIT is still set.
+        let waiter = self.0.initialize(false).expect("Got a QuickInitGuard in slow init");
+        let guard = waiter.guard.expect("No guard available even without polling");
+        if guard.queue.is_null() {
+            // The queue was already freed by someone else before we got our QueueRef (this must
+            // have happend between the load of prev_state and initialize, because otherwise we
+            // would have taken the fast path).  This implies that all other tasks have noticed
+            // READY_BIT and do not need waking, so there is nothing left for us to do except
+            // release our reference.
+            drop(guard);
+        } else {
+            // Safety: the guard holds a place on the waiter list and we just checked that the
+            // queue is non-null.  It will remain valid until guard is dropped.
+            let queue = unsafe { &*guard.queue };
+            let mut lock = queue.wakers.lock().unwrap();
+
+            // Ensure that nobody else can grab the QueueHead between when we release QINIT_BIT and
+            // when our QueueHead is dropped.
+            lock.get_or_insert_with(Vec::new);
+            // Allow someone else to take the head position once we drop it.  Ordering is handled
+            // by the Mutex.
+            self.0.state.fetch_and(!QINIT_BIT, Ordering::Relaxed);
+            drop(lock);
+
+            // Safety: we just took the head position, and we were the QuickInitGuard
+            drop(QueueHead { guard })
         }
-        // Get a guard, create the QueueHead we should have been holding, then drop it so that the
-        // tasks are woken as intended.  This is needed regardless of if we succeeded or not -
-        // either waiters need to run init themselves, or they need to read the value we set.
-        let guard = self.0.initialize().guard.unwrap();
-        // Note: in strange corner cases we can get a guard with a NULL queue here
-        drop(QueueHead { guard })
     }
 }
 
@@ -264,7 +319,7 @@ impl<'a> Future for QueueWaiter<'a> {
             return task::Poll::Ready(None);
         }
 
-        // Safety: the guard holds a place on the waiter list and we just check that the state is
+        // Safety: the guard holds a place on the waiter list and we just checked that the state is
         // not ready, so the queue is non-null and will remain valid until guard is dropped.
         let queue = unsafe { &*guard.queue };
         let mut lock = queue.wakers.lock().unwrap();
@@ -278,12 +333,22 @@ impl<'a> Future for QueueWaiter<'a> {
         }
 
         match lock.as_mut() {
-            None => {
+            None if state & QINIT_BIT == 0 => {
                 // take the head position and start a waker queue
                 *lock = Some(Vec::new());
                 drop(lock);
 
+                // Safety: we know that nobody else has a QuickInitGuard because we are holding a
+                // QueueRef that prevents state from being 0 (which is required to create a
+                // new QuickInitGuard), and we just checked that one wasn't created before we
+                // created our QueueRef.
                 task::Poll::Ready(Some(QueueHead { guard: self.guard.take().unwrap() }))
+            }
+            None => {
+                // Someone else has a QuickInitGuard; they will wake us when they finish.
+                let waker = cx.waker().clone();
+                *lock = Some(vec![waker]);
+                task::Poll::Pending
             }
             Some(wakers) => {
                 // Wait for the QueueHead to be dropped
@@ -304,9 +369,13 @@ impl<'a> Drop for QueueHead<'a> {
     fn drop(&mut self) {
         // Safety: if queue is not null, then it is valid as long as the guard is alive
         if let Some(queue) = unsafe { self.guard.queue.as_ref() } {
-            let mut lock = queue.wakers.lock().unwrap();
             // Take the waker queue so the next QueueWaiter can make a new one
-            let wakers = lock.take().expect("QueueHead dropped without a waker list");
+            let wakers = queue
+                .wakers
+                .lock()
+                .expect("Lock poisoned")
+                .take()
+                .expect("QueueHead dropped without a waker list");
             for waker in wakers {
                 waker.wake();
             }
@@ -358,42 +427,51 @@ impl<T> OnceCell<T> {
         let state = self.inner.state.load(Ordering::Acquire);
 
         if state & READY_BIT == 0 {
-            if state == NEW {
-                // If there is no contention, we can initialize without allocations.  Try it.
-                if let Some(guard) = self.inner.try_quick_init() {
-                    let value = init.await?;
-                    unsafe {
-                        *self.value.get() = Some(value);
-                    }
-                    self.inner.set_ready();
-                    drop(guard);
-
-                    return Ok(unsafe { (&*self.value.get()).as_ref().unwrap() });
-                }
-            }
-
-            let guard = self.inner.initialize();
-            if let Some(init_lock) = guard.await {
-                // We hold the QueueHead, so we know that nobody else has successfully run an init
-                // poll and that nobody else can start until it is dropped.  On error, panic, or
-                // drop of this Future, the head will be passed to another waiter.
-                let value = init.await?;
-
-                // We still hold the head, so nobody else can write to value
-                unsafe {
-                    *self.value.get() = Some(value);
-                }
-                // mark the cell ready before giving up the head
-                init_lock.guard.inner.set_ready();
-                // drop of QueueHead notifies other Futures
-                // drop of QueueRef (might) free the Queue
-            } else {
-                // someone initialized it while waiting on the queue
-            }
+            self.init_slow(state == NEW, init).await?;
         }
 
         // Safety: initialized on all paths
         Ok(unsafe { (&*self.value.get()).as_ref().unwrap() })
+    }
+
+    #[cold]
+    async fn init_slow<E>(
+        &self,
+        try_quick: bool,
+        init: impl Future<Output = Result<T, E>>,
+    ) -> Result<(), E> {
+        match self.inner.initialize(try_quick) {
+            Err(guard) => {
+                // Try to proceed assuming no contention.
+                let value = init.await?;
+                // Safety: the guard acts like QueueHead even if there is contention.
+                unsafe {
+                    *self.value.get() = Some(value);
+                }
+                self.inner.set_ready();
+                drop(guard);
+            }
+            Ok(guard) => {
+                if let Some(init_lock) = guard.await {
+                    // We hold the QueueHead, so we know that nobody else has successfully run an init
+                    // poll and that nobody else can start until it is dropped.  On error, panic, or
+                    // drop of this Future, the head will be passed to another waiter.
+                    let value = init.await?;
+
+                    // Safety: We still hold the head, so nobody else can write to value
+                    unsafe {
+                        *self.value.get() = Some(value);
+                    }
+                    // mark the cell ready before giving up the head
+                    init_lock.guard.inner.set_ready();
+                    // drop of QueueHead notifies other Futures
+                    // drop of QueueRef (might) free the Queue
+                } else {
+                    // someone initialized it while waiting on the queue
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Gets the reference to the underlying value.
@@ -442,37 +520,60 @@ impl<T> OnceCell<T> {
 /// assert_eq!(value, &4);
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct OnceFuture<T, F = Pin<Box<dyn Future<Output = T> + Send>>, I = Infallible> {
     value: UnsafeCell<LazyState<T, I>>,
     inner: LazyInner<F>,
 }
 
+// Safety: acts like RwLock<T> + Mutex<(I,F)>.
 unsafe impl<T: Sync + Send, F: Send, I: Send> Sync for OnceFuture<T, F, I> {}
 unsafe impl<T: Send, F: Send, I: Send> Send for OnceFuture<T, F, I> {}
+
+// We pin F inside the allocated LazyWaker; this object can be moved freely
 impl<T, F, I> Unpin for OnceFuture<T, F, I> {}
+
+// It is possible to get T and I with &mut self, and &T with &self
 impl<T: RefUnwindSafe + UnwindSafe, F, I: RefUnwindSafe> RefUnwindSafe for OnceFuture<T, F, I> {}
 impl<T: UnwindSafe, F, I: UnwindSafe> UnwindSafe for OnceFuture<T, F, I> {}
 
-enum LazyState<T, F> {
-    New(F),
+enum LazyState<T, I> {
+    New(I),
     Running,
     Ready(T),
 }
 
+#[derive(Debug)]
 struct LazyInner<F> {
     state: AtomicUsize,
     queue: AtomicPtr<LazyWaker<F>>,
 }
 
+/// Contents of the Arc held by LazyInner and by any Waker given to the future.  This value is
+/// pinned in the Arc.
 struct LazyWaker<F> {
     future: UnsafeCell<Option<F>>,
-    wakers: Mutex<Vec<task::Waker>>,
+    wakers: Mutex<(WakerState, Vec<task::Waker>)>,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum WakerState {
+    Unlocked,
+    /// A task is currently polling the future or will soon start polling it
+    LockedWithoutWake,
+    /// The future returned Pending and has not seen a wakeup
+    Pending,
+    /// A task is currently polling the future but a wake has already been sent
+    LockedWoken,
+}
+
+// Safety: acts like Mutex<F>
 unsafe impl<F: Send> Send for LazyWaker<F> {}
 unsafe impl<F: Send> Sync for LazyWaker<F> {}
 
+/// A lock guard given to exactly one poller of a LazyWaker at a time.
 struct LazyHead<'a, F> {
+    // Note: this structure is passed to mem::forget during normal use; do not add Drop fields.
     waker: &'a Arc<LazyWaker<F>>,
 }
 
@@ -491,8 +592,10 @@ impl<F> LazyInner<F> {
 
         let mut queue = self.queue.load(Ordering::Acquire);
         if queue.is_null() && prev_state & READY_BIT == 0 {
-            let waker: LazyWaker<F> =
-                LazyWaker { future: UnsafeCell::new(None), wakers: Mutex::new(Vec::new()) };
+            let waker: LazyWaker<F> = LazyWaker {
+                future: UnsafeCell::new(None),
+                wakers: Mutex::new((WakerState::Unlocked, Vec::new())),
+            };
 
             // Race with other callers of initialize to create the queue
             let new_queue = Arc::into_raw(Arc::new(waker)) as *mut _;
@@ -521,6 +624,8 @@ impl<F> LazyInner<F> {
         let rv = if queue.is_null() {
             None
         } else {
+            // Safety: the queue won't be freed due to the refcount raise at the start of the
+            // function, and if queue is nonnull it has at least one strong ref.
             unsafe {
                 Arc::increment_strong_count(queue as *const _);
                 Some(Arc::from_raw(queue as *const _))
@@ -538,6 +643,9 @@ impl<F> LazyInner<F> {
             if prev_state == READY_BIT + 1 {
                 let queue = self.queue.swap(ptr::null_mut(), Ordering::Acquire);
                 if !queue.is_null() {
+                    // Safety: no other callers of initialize were present and any future ones will
+                    // also observe READY_BIT.  This is the only function that uses this reference,
+                    // so if we got a nonnull queue we are the only user of this reference.
                     unsafe {
                         Arc::decrement_strong_count(queue as *const _);
                     }
@@ -572,21 +680,24 @@ impl<F> Drop for LazyInner<F> {
     fn drop(&mut self) {
         let queue = *self.queue.get_mut();
         if !queue.is_null() {
-            // Safety: nobody else could have a reference
+            // Safety: the only user of this reference is initialize, and we know it is not running
+            // because it uses a borrow of this object.
             unsafe {
-                Arc::from_raw(queue);
+                Arc::decrement_strong_count(queue);
             }
         }
     }
 }
 
 impl<F> LazyWaker<F> {
+    /// Return a LazyHead if the caller was the first task to arrive and the cell is still empty.
+    /// Otherwise, return None if the cell is already populated and Pending otherwise.
     fn poll_head<'a>(
         self: &'a Arc<Self>,
         cx: &mut task::Context<'_>,
         inner: &LazyInner<F>,
     ) -> task::Poll<Option<LazyHead<'a, F>>> {
-        let mut wakers = self.wakers.lock().unwrap();
+        let mut lock = self.wakers.lock().unwrap();
 
         // Don't give out the head if the cell is ready
         let state = inner.state.load(Ordering::Acquire);
@@ -594,22 +705,26 @@ impl<F> LazyWaker<F> {
             return task::Poll::Ready(None);
         }
 
-        // The head position is given to the first locker of the wakers list
+        let wakers = &mut lock.1;
         let my_waker = cx.waker();
-        let got_lock = wakers.is_empty();
         for waker in wakers.iter() {
             if waker.will_wake(my_waker) {
                 return task::Poll::Pending;
             }
         }
-
         wakers.push(my_waker.clone());
 
-        if got_lock {
-            task::Poll::Ready(Some(LazyHead { waker: self }))
-        } else {
-            // Anyone not given the head will be woken when it's time to poll the future again.
-            task::Poll::Pending
+        match lock.0 {
+            WakerState::Unlocked => {
+                // Safety: this state change means we are the only LazyHead present
+                lock.0 = WakerState::LockedWithoutWake;
+                task::Poll::Ready(Some(LazyHead { waker: self }))
+            }
+            _ => {
+                // In all other cases, someone will wake us: the owner of LazyHead if locked or the
+                // Waker if the task was pending.
+                task::Poll::Pending
+            }
         }
     }
 }
@@ -620,7 +735,24 @@ impl<F> task::Wake for LazyWaker<F> {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let wakers = mem::replace(&mut *self.wakers.lock().unwrap(), Vec::new());
+        let mut lock = self.wakers.lock().unwrap();
+        match lock.0 {
+            WakerState::LockedWithoutWake => {
+                // Postposne propagating the wakes until the poll is complete
+                lock.0 = WakerState::LockedWoken;
+                return;
+            }
+            WakerState::LockedWoken => return,
+            WakerState::Pending => {
+                lock.0 = WakerState::Unlocked;
+            }
+            WakerState::Unlocked => {
+                // Note: the waker list should be empty
+            }
+        }
+        let wakers = mem::replace(&mut lock.1, Vec::new());
+        // Avoid holding the lock while waking in case there is a recursive wake
+        drop(lock);
         for waker in wakers {
             waker.wake();
         }
@@ -628,38 +760,75 @@ impl<F> task::Wake for LazyWaker<F> {
 }
 
 impl<'a, F> LazyHead<'a, F> {
-    fn poll_inner(self, init: impl FnOnce() -> F) -> task::Poll<F::Output>
+    fn poll_inner(self, init: impl FnOnce() -> F) -> task::Poll<(Self, F::Output)>
     where
         F: Future + Send + 'static,
     {
         let ptr = self.waker.future.get();
+        // Safety: only one task can acquire a LazyHead object, so we are safe to modify the shared
+        // state.  The value of ptr is inside an Arc that is never exposed outside this module (and
+        // we never call get_mut on the Arc), so the contents follow the rules of Pin even if the
+        // Arc was not created using Arc::pin.
         let fut = unsafe { Pin::new_unchecked((*ptr).get_or_insert_with(init)) };
         let shared_waker = task::Waker::from(Arc::clone(self.waker));
         let mut ctx = task::Context::from_waker(&shared_waker);
-        let rv = fut.poll(&mut ctx);
-        if rv.is_pending() {
-            // If the inner future is pending, LazyHead should not send out wakes on drop; it
-            // should wait to be woken by the inner future's poll.  This also prevents any other
-            // task from acquiring a LazyHead until the LazyWaker is woken.
-            mem::forget(self);
-        } else {
-            // Drop the pinned Future now that it has completed.
-            unsafe {
-                *ptr = None;
+        match fut.poll(&mut ctx) {
+            task::Poll::Pending => {
+                // The inner future is pending, so LazyHead should not send out wakes until or
+                // unless the shared waker has been used.
+                let mut lock = self.waker.wakers.lock().unwrap();
+                match lock.0 {
+                    WakerState::LockedWithoutWake => {
+                        lock.0 = WakerState::Pending;
+                        drop(lock);
+                    }
+                    WakerState::LockedWoken => {
+                        // There was a wake while we held the lock.  Send wakes to all tasks.
+                        lock.0 = WakerState::Unlocked;
+                        let wakers = mem::replace(&mut lock.1, Vec::new());
+                        drop(lock);
+                        for waker in wakers {
+                            waker.wake();
+                        }
+                    }
+                    WakerState::Pending | WakerState::Unlocked => {
+                        unreachable!();
+                    }
+                }
+                // we just did the drop implementation, don't do it again.
+                mem::forget(self);
+                task::Poll::Pending
+            }
+            task::Poll::Ready(value) => {
+                // Drop the pinned Future now that it has completed.  Safety: we still hold the lock.
+                unsafe {
+                    *ptr = None;
+                }
+                task::Poll::Ready((self, value))
             }
         }
-        rv
     }
 }
 
 impl<'a, F> Drop for LazyHead<'a, F> {
     fn drop(&mut self) {
-        // Note: this is only called if the poll_inner was Ready or in case of panic.
-        //
-        // Flush the queue and wake all the tasks that were waiting.  One of them will pick up the
-        // poll if it's not done, or they will all pick up the value if it's ready.
-        let mut wakers = self.waker.wakers.lock().unwrap();
-        for waker in mem::replace(&mut *wakers, Vec::new()) {
+        // Note: this is only called if the poll_inner was Ready or in case of panic.  In either
+        // case, we should transition to an Unlocked state and wake all waiting tasks.  If the
+        // future was ready, they will all be able to pick up the value; if it paniced, the next
+        // task in line will retry the poll (which will just panic again if the future was
+        // generated by an async block).
+        let mut lock = self.waker.wakers.lock().unwrap();
+        match lock.0 {
+            WakerState::LockedWoken | WakerState::LockedWithoutWake => {
+                lock.0 = WakerState::Unlocked;
+            }
+            WakerState::Unlocked | WakerState::Pending => {
+                unreachable!();
+            }
+        }
+        let wakers = mem::replace(&mut lock.1, Vec::new());
+        drop(lock);
+        for waker in wakers {
             waker.wake();
         }
     }
@@ -683,6 +852,7 @@ impl<T, F, I> OnceFuture<T, F, I> {
         if state & READY_BIT == 0 {
             None
         } else {
+            // Safety: READY_BIT is set
             unsafe {
                 match &*self.value.get() {
                     LazyState::Ready(v) => Some(v),
@@ -799,6 +969,7 @@ where
                 task::Poll::Ready(()) => {}
             }
         }
+        // Safety: just initialized
         unsafe {
             match &*self.value.get() {
                 LazyState::Ready(v) => task::Poll::Ready(v),
@@ -807,6 +978,7 @@ where
         }
     }
 
+    /// Do the actual init work.  If this returns Ready, the initialization succeeded.
     #[cold]
     fn init_slow(
         &self,
@@ -821,6 +993,7 @@ where
 
         match waker.poll_head(cx, &self.inner) {
             task::Poll::Ready(Some(init_lock)) => {
+                // Safety: init_lock ensures we have exclusive access
                 let value = mem::replace(unsafe { &mut *self.value.get() }, LazyState::Running);
                 let init = match value {
                     LazyState::New(init) => Some(init),
@@ -829,12 +1002,13 @@ where
                 };
 
                 match init_lock.poll_inner(move || into_future(init)) {
-                    task::Poll::Ready(value) => {
-                        // initialization complete
+                    task::Poll::Ready((lock, value)) => {
+                        // Safety: we still hold the lock
                         unsafe {
                             *self.value.get() = LazyState::Ready(value);
                         }
                         self.inner.set_ready();
+                        drop(lock);
                     }
                     task::Poll::Pending => return task::Poll::Pending,
                 }
@@ -880,6 +1054,7 @@ where
 /// assert_eq!((&foo.value).await, &4);
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct Lazy<T, F = Pin<Box<dyn Future<Output = T> + Send>>> {
     once: OnceFuture<T, F>,
 }
@@ -938,6 +1113,7 @@ where
 ///
 /// Note: This structure may be larger in size than [Lazy], but it does not allocate on the heap
 /// until it is first polled, so is suitable for initializing statics.
+#[derive(Debug)]
 pub struct ConstLazy<T, F> {
     once: OnceFuture<T, F, F>,
 }
