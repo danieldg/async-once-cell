@@ -33,6 +33,29 @@ use std::{
 /// This allows initialization using an async closure that borrows from its environment.
 ///
 /// Unlike [OnceFuture], the initialing closures do not require `Send + 'static` bounds.
+///
+/// ```
+/// # async fn run() {
+/// use std::rc::Rc;
+/// use std::sync::Arc;
+/// use async_once_cell::OnceCell;
+///
+/// let non_send_value = Rc::new(4);
+/// let shared = Arc::new(OnceCell::new());
+///
+/// let value : &i32 = shared.get_or_init(async {
+///     *non_send_value
+/// }).await;
+/// assert_eq!(value, &4);
+///
+/// // A second init is not called
+/// let second = shared.get_or_init(async {
+///     unreachable!()
+/// }).await;
+/// assert_eq!(second, &4);
+///
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct OnceCell<T> {
     value: UnsafeCell<Option<T>>,
@@ -406,7 +429,20 @@ impl<T> OnceCell<T> {
 ///
 /// This is primarily used as a building block for [Lazy] and [ConstLazy], but can be used on its
 /// own to produce more complex building blocks.
-pub struct OnceFuture<T, F = Box<dyn Future<Output = T> + Send>, I = Infallible> {
+///
+/// ```
+/// # async fn run() {
+/// use std::sync::Arc;
+/// use async_once_cell::OnceFuture;
+///
+/// let shared = Arc::new(OnceFuture::new());
+/// let value : &i32 = shared.get_or_init_with(|| async {
+///     4
+/// }).await;
+/// assert_eq!(value, &4);
+/// # }
+/// ```
+pub struct OnceFuture<T, F = Pin<Box<dyn Future<Output = T> + Send>>, I = Infallible> {
     value: UnsafeCell<LazyState<T, I>>,
     inner: LazyInner<F>,
 }
@@ -814,7 +850,38 @@ where
 /// A value which is initialized on the first access.
 ///
 /// See [ConstLazy] if you need to initialize in a const context.
-pub struct Lazy<T, F = Box<dyn Future<Output = T> + Send>> {
+///
+/// ```
+/// # async fn run() {
+/// use std::sync::Arc;
+/// use async_once_cell::Lazy;
+///
+/// let shared = Arc::new(Lazy::new(async {
+///     4
+/// }));
+///
+/// let value : &i32 = shared.get().await;
+/// assert_eq!(value, &4);
+/// # }
+/// ```
+///
+/// You can also call `await` on a reference:
+///
+/// ```
+/// # async fn run() {
+/// use async_once_cell::Lazy;
+/// struct Foo {
+///     value: Lazy<i32>,
+/// }
+///
+/// let foo = Foo {
+///     value : Lazy::new(Box::pin(async { 4 })),
+/// };
+///
+/// assert_eq!((&foo.value).await, &4);
+/// # }
+/// ```
+pub struct Lazy<T, F = Pin<Box<dyn Future<Output = T> + Send>>> {
     once: OnceFuture<T, F>,
 }
 
