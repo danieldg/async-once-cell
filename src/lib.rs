@@ -427,8 +427,8 @@ impl<T> OnceCell<T> {
 
 /// A Future which is executed exactly once, producing an output accessible without locking.
 ///
-/// This is primarily used as a building block for [Lazy] and [ConstLazy], but can be used on its
-/// own to produce more complex building blocks.
+/// This is primarily used as a building block for [Lazy] and [ConstLazy], but can also be used on
+/// its own similar to [OnceCell].
 ///
 /// ```
 /// # async fn run() {
@@ -735,7 +735,7 @@ where
 {
     /// Creates a new OnceFuture directly from a Future.
     ///
-    /// The `gen_future` or `init_future` functions will never be called.
+    /// The `gen_future` or `into_future` closures will never be called.
     pub fn from_future(future: F) -> Self {
         let rv = Self::new();
         let waker = rv.inner.initialize().unwrap();
@@ -753,22 +753,18 @@ where
 {
     /// Create and run the future until it produces a result, then return a reference to that
     /// result.
+    ///
+    /// This is a convenience wrapper around [OnceFuture::get_or_populate_with] for use when the
+    /// initializer value is not used or not present.
     pub async fn get_or_init_with(&self, gen_future: impl FnOnce() -> F) -> &T {
         self.get_or_populate_with(move |_| gen_future()).await
     }
 
     /// Create and run the future until it produces a result, then return a reference to that
     /// result.
-    pub fn poll_init_with(
-        &self,
-        cx: &mut task::Context<'_>,
-        gen_future: impl FnOnce() -> F,
-    ) -> task::Poll<&T> {
-        self.poll_populate(cx, move |_| gen_future())
-    }
-
-    /// Create and run the future until it produces a result, then return a reference to that
-    /// result.
+    ///
+    /// Only one `into_future` closure will be called per `OnceFuture` instance, and only if the
+    /// future was not already set by `from_future`.
     pub async fn get_or_populate_with(&self, into_future: impl FnOnce(Option<I>) -> F) -> &T {
         struct Get<'a, T, F, I, P>(&'a OnceFuture<T, F, I>, Option<P>);
 
@@ -788,6 +784,9 @@ where
 
     /// Create and run the future until it produces a result, then return a reference to that
     /// result.
+    ///
+    /// Only one `into_future` closure will be called per `OnceFuture` instance, and only if the
+    /// future was not already set by `from_future`.
     pub fn poll_populate(
         &self,
         cx: &mut task::Context<'_>,
@@ -930,7 +929,8 @@ where
 {
     type Output = &'a T;
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
-        self.once.poll_populate(cx, |_| panic!("Polled after initializer panicked"))
+        // The init closure is unreachable because we always start with the Future set.
+        self.once.poll_populate(cx, |_| unreachable!())
     }
 }
 
@@ -987,6 +987,7 @@ where
 {
     type Output = &'a T;
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
-        self.once.poll_populate(cx, |i| i.expect("Polled after initializer panicked").into())
+        // The init closure always has an initialization value
+        self.once.poll_populate(cx, |i| i.unwrap_or_else(|| unreachable!()))
     }
 }
