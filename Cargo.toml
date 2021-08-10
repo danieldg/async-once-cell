@@ -1,0 +1,19 @@
+[package]
+name = "async-once-cell"
+version = "0.2.0"
+authors = ["Daniel De Graaf <code@danieldg.net>"]
+license = "MIT OR Apache-2.0"
+edition = "2018"
+
+description = "Async single assignment cells and lazy values."
+readme = "README.md"
+documentation = "https://docs.rs/async_once_cell"
+
+repository = "https://github.com/danieldg/async-once-cell"
+keywords = ["lazy", "static", "async"]
+categories = ["rust-patterns", "memory-management"]
+
+[features]
+
+[package.metadata.docs.rs]
+all-features = true
