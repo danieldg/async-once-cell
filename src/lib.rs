@@ -8,7 +8,7 @@
 //! Unlike threads, tasks can be cancelled at any point where they block.  [OnceCell] deals with
 //! this by allowing another initializer to run if the task currently initializing the cell is
 //! dropped.  This also allows for fallible initialization using [OnceCell::get_or_try_init], and
-//! for the initializing `Future` to contain borrows or use references thread-local data.
+//! for the initializing `Future` to contain borrows or use references to thread-local data.
 //!
 //! [OnceFuture] and its wrappers [Lazy] and [ConstLazy] take the opposite approach: they wrap a
 //! single `Future` which is cooperatively run to completion by any polling task.  This requires
@@ -122,6 +122,10 @@ const READY_BIT: usize = 1 + (usize::MAX >> 1);
 impl Inner {
     const fn new() -> Self {
         Inner { state: AtomicUsize::new(NEW), queue: AtomicPtr::new(ptr::null_mut()) }
+    }
+
+    const fn new_ready() -> Self {
+        Inner { state: AtomicUsize::new(READY_BIT), queue: AtomicPtr::new(ptr::null_mut()) }
     }
 
     /// Initialize the queue (if needed) and return a waiter that can be polled to get a QueueHead
@@ -387,6 +391,15 @@ impl<T> OnceCell<T> {
     /// Creates a new empty cell.
     pub const fn new() -> Self {
         Self { value: UnsafeCell::new(None), inner: Inner::new() }
+    }
+
+    /// Creates a new cell with the given contents.
+    pub const fn new_with(value: Option<T>) -> Self {
+        let inner = match value {
+            Some(_) => Inner::new_ready(),
+            None => Inner::new(),
+        };
+        Self { value: UnsafeCell::new(value), inner }
     }
 
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.
@@ -846,6 +859,31 @@ impl<T, F, I> OnceFuture<T, F, I> {
         }
     }
 
+    /// Creates a new OnceFuture without an initializing value
+    ///
+    /// The resulting Future must be produced by the closure passed to [Self::get_or_init_with].
+    /// This function is identical to [Self::new] but is more likely to need type hints.
+    pub const fn with_no_init() -> Self {
+        OnceFuture {
+            value: UnsafeCell::new(LazyState::Running),
+            inner: LazyInner {
+                state: AtomicUsize::new(NEW),
+                queue: AtomicPtr::new(ptr::null_mut()),
+            },
+        }
+    }
+
+    /// Creates a new OnceFuture that is immediately ready
+    pub const fn with_value(value: T) -> Self {
+        OnceFuture {
+            value: UnsafeCell::new(LazyState::Ready(value)),
+            inner: LazyInner {
+                state: AtomicUsize::new(READY_BIT),
+                queue: AtomicPtr::new(ptr::null_mut()),
+            },
+        }
+    }
+
     /// Gets the value without blocking or starting the initialization.
     pub fn get(&self) -> Option<&T> {
         let state = self.inner.state.load(Ordering::Acquire);
@@ -889,13 +927,7 @@ impl<T, F> OnceFuture<T, F> {
     ///
     /// The resulting Future must be produced by the closure passed to get_or_init_with
     pub const fn new() -> Self {
-        OnceFuture {
-            value: UnsafeCell::new(LazyState::Running),
-            inner: LazyInner {
-                state: AtomicUsize::new(NEW),
-                queue: AtomicPtr::new(ptr::null_mut()),
-            },
-        }
+        Self::with_no_init()
     }
 }
 
@@ -1059,7 +1091,30 @@ pub struct Lazy<T, F = Pin<Box<dyn Future<Output = T> + Send>>> {
     once: OnceFuture<T, F>,
 }
 
+impl<T, F> Lazy<T, F>
+where
+    F: Future<Output = T> + Send + 'static,
+{
+    /// Creates a new lazy value with the given initializing future.
+    pub fn new(future: F) -> Self {
+        Lazy { once: OnceFuture::from_future(future) }
+    }
+
+    /// Forces the evaluation of this lazy value and returns a reference to the result.
+    ///
+    /// This is equivalent to the `Future` impl on `&Lazy`, but is explicit and may be simpler to
+    /// call.  This will panic if the initializing closure panics or has panicked.
+    pub async fn get(&self) -> &T {
+        self.await
+    }
+}
+
 impl<T, F> Lazy<T, F> {
+    /// Creates an already-initialized lazy value.
+    pub const fn with_value(value: T) -> Self {
+        Self { once: OnceFuture::with_value(value) }
+    }
+
     /// Gets the value without blocking or starting the initialization.
     pub fn try_get(&self) -> Option<&T> {
         self.once.get()
@@ -1077,24 +1132,6 @@ impl<T, F> Lazy<T, F> {
     pub fn into_value(self) -> Option<T> {
         // It would be confusing to only sometimes return the future, and it's rarely useful.
         self.once.into_inner().1
-    }
-}
-
-impl<T, F> Lazy<T, F>
-where
-    F: Future<Output = T> + Send + 'static,
-{
-    /// Creates a new lazy value with the given initializing future.
-    pub fn new(future: F) -> Self {
-        Lazy { once: OnceFuture::from_future(future) }
-    }
-
-    /// Forces the evaluation of this lazy value and returns a reference to the result.
-    ///
-    /// This is equivalent to the `Future` impl on `&Lazy`, but is explicit and may be simpler to
-    /// call.  This will panic if the initializing closure panics or has panicked.
-    pub async fn get(&self) -> &T {
-        self.await
     }
 }
 
@@ -1122,6 +1159,11 @@ impl<T, F> ConstLazy<T, F> {
     /// Creates a new lazy value with the given initializing future.
     pub const fn new(future: F) -> Self {
         ConstLazy { once: OnceFuture::with_init(future) }
+    }
+
+    /// Creates an already-initialized lazy value.
+    pub const fn with_value(value: T) -> Self {
+        Self { once: OnceFuture::with_value(value) }
     }
 
     /// Gets the value without blocking or starting the initialization.
