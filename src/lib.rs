@@ -569,7 +569,7 @@ where
     F: Future<Output = T>,
 {
     /// Creates a new lazy value with the given initializing future.
-    pub fn new(future: F) -> Self {
+    pub const fn new(future: F) -> Self {
         Self::from_future(future)
     }
 
