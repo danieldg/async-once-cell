@@ -515,6 +515,7 @@ impl<T> OnceCell<T> {
 
     /// Takes the value out of this `OnceCell`, moving it back to an uninitialized state.
     pub fn take(&mut self) -> Option<T> {
+        self.inner = Inner::new();
         self.value.get_mut().take()
     }
 
