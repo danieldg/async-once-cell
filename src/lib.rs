@@ -205,7 +205,7 @@ impl Inner {
         // writes to the cell's value are visible to the cell's readers.
         let prev_state = self.state.fetch_or(READY_BIT, Ordering::Release);
 
-        debug_assert_eq!(prev_state & READY_BIT, 0, "Invalid state: somoene else set READY_BIT");
+        debug_assert_eq!(prev_state & READY_BIT, 0, "Invalid state: someone else set READY_BIT");
     }
 }
 
@@ -280,7 +280,7 @@ impl<'a> Drop for QuickInitGuard<'a> {
         let guard = waiter.guard.expect("No guard available even without polling");
         if guard.queue.is_null() {
             // The queue was already freed by someone else before we got our QueueRef (this must
-            // have happend between the load of prev_state and initialize, because otherwise we
+            // have happened between the load of prev_state and initialize, because otherwise we
             // would have taken the fast path).  This implies that all other tasks have noticed
             // READY_BIT and do not need waking, so there is nothing left for us to do except
             // release our reference.
@@ -413,7 +413,7 @@ impl<T> OnceCell<T> {
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.
     ///
     /// Many tasks may call `get_or_init` concurrently with different initializing futures, but
-    /// it is guaranteed that only one future will be executed as long as the resuting future is
+    /// it is guaranteed that only one future will be executed as long as the resulting future is
     /// polled to completion.
     ///
     /// If `init` panics, the panic is propagated to the caller, and the cell remains uninitialized.
@@ -639,6 +639,20 @@ where
                 }
             }
         }
+    }
+}
+
+impl<T, F> Lazy<T, F>
+where
+    F: Future<Output = T> + Unpin,
+{
+    /// Forces the evaluation of this lazy value and returns a reference to the result.
+    ///
+    /// Unlike [Self::get], this does not require pinning the object.
+    pub async fn get_unpin(&self) -> &T {
+        // The get() function itself does not use the fact that T is pinned, and Pin::deref already
+        // exposes a &T from Pin<&T> (although not with the right lifetime).
+        unsafe { Pin::into_inner_unchecked(Pin::new_unchecked(self).get().await) }
     }
 }
 
