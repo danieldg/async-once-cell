@@ -14,7 +14,12 @@ keywords = ["lazy", "static", "async"]
 categories = ["rust-patterns", "memory-management"]
 
 [features]
-unpin = []
+unpin = ['std']
+critical-section = ['dep:critical-section']
+std = []
+
+[dependencies]
+critical-section = { version = "1", optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
