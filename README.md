@@ -1,5 +1,5 @@
-[![Crates.io](https://img.shields.io/crates/v/async_once_cell.svg)](https://crates.io/crates/async_once_cell)
-[![API reference](https://docs.rs/async_once_cell/badge.svg)](https://docs.rs/async_once_cell/)
+[![Crates.io](https://img.shields.io/crates/v/async_once_cell.svg)](https://crates.io/crates/async-once-cell)
+[![API reference](https://docs.rs/async-once-cell/badge.svg)](https://docs.rs/async-once-cell/)
 
 # Overview
 
