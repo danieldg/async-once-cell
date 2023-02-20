@@ -267,7 +267,7 @@ impl Inner {
                     guard.queue = actual;
                     // Safety: we just allocated it, and nobody else has seen it
                     unsafe {
-                        Box::from_raw(new_queue);
+                        drop(Box::from_raw(new_queue));
                     }
                 }
             }
@@ -299,7 +299,7 @@ impl<'a> Drop for QueueRef<'a> {
                 // Safety: the last guard is being freed, and queue is only used by guard-holders.
                 // Due to the swap, we are the only one who is freeing this particular queue.
                 unsafe {
-                    Box::from_raw(queue);
+                    drop(Box::from_raw(queue));
                 }
             }
         }
@@ -336,7 +336,7 @@ impl<'a> Drop for QuickInitGuard<'a> {
                         // guard-holders.  Due to the swap, we are the only one who is freeing this
                         // particular queue.
                         unsafe {
-                            Box::from_raw(queue);
+                            drop(Box::from_raw(queue));
                         }
                     }
                 }
@@ -386,7 +386,7 @@ impl Drop for Inner {
         if !queue.is_null() {
             // Safety: nobody else could have a reference
             unsafe {
-                Box::from_raw(queue);
+                drop(Box::from_raw(queue));
             }
         }
     }
