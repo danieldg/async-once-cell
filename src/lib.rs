@@ -479,6 +479,8 @@ impl<T> OnceCell<T> {
     }
 
     /// Creates a new cell with the given contents.
+    ///
+    /// If value is `None`, this is equivalent to `new()`.
     pub const fn new_with(value: Option<T>) -> Self {
         let inner = match value {
             Some(_) => Inner::new_ready(),
@@ -496,10 +498,11 @@ impl<T> OnceCell<T> {
     /// If `init` panics, the panic is propagated to the caller, and the cell remains uninitialized.
     ///
     /// If the Future returned by this function is dropped prior to completion, the cell remains
-    /// uninitialized (and another init futures may be selected for polling).
+    /// uninitialized, and another `init` function will be started (if any are available).
     ///
     /// It is an error to reentrantly initialize the cell from `init`.  The current implementation
-    /// deadlocks, but will recover if the offending task is dropped.
+    /// deadlocks, but will recover if the offending task is dropped or if the future is actually
+    /// able to proceed despite the reentrant call never returning.
     pub async fn get_or_init(&self, init: impl Future<Output = T>) -> &T {
         match self.get_or_try_init(async move { Ok::<T, Infallible>(init.await) }).await {
             Ok(t) => t,
@@ -510,14 +513,16 @@ impl<T> OnceCell<T> {
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.   If the
     /// cell was empty and `init` failed, an error is returned.
     ///
-    /// If `init` panics, the panic is propagated to the caller, and the cell remains
-    /// uninitialized.
+    /// If `init` panics or returns an error, the panic or error is propagated to the caller, and
+    /// the cell remains uninitialized.  In this case, another `init` function from a concurrent
+    /// caller will be selected to execute, if one is available.
     ///
     /// If the Future returned by this function is dropped prior to completion, the cell remains
-    /// uninitialized.
+    /// uninitialized, and another `init` function will be started.
     ///
     /// It is an error to reentrantly initialize the cell from `init`.  The current implementation
-    /// deadlocks, but will recover if the offending task is dropped.
+    /// deadlocks, but will recover if the offending task is dropped or if the future is actually
+    /// able to proceed despite the reentrant call never returning.
     pub async fn get_or_try_init<E>(
         &self,
         init: impl Future<Output = Result<T, E>>,
@@ -599,6 +604,18 @@ impl<T> OnceCell<T> {
     /// Consumes the OnceCell, returning the wrapped value. Returns None if the cell was empty.
     pub fn into_inner(self) -> Option<T> {
         self.value.into_inner()
+    }
+}
+
+impl<T> Default for OnceCell<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> From<T> for OnceCell<T> {
+    fn from(value: T) -> Self {
+        Self::new_with(Some(value))
     }
 }
 
