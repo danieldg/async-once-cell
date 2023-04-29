@@ -58,7 +58,7 @@
 //  5. Inner::state transitions from QINIT_BIT to READY_BIT during QuickInitGuard's Drop
 //
 // If the init future fails (due to returning an error or a panic), then:
-//  4. The UnsafeCell remains set to None
+//  4. The UnsafeCell remains uninitialized
 //  5. Inner::state transitions from QINIT_BIT to NEW during QuickInitGuard's Drop
 //
 // The fast path does not use Inner::queue at all, and only needs to check it once the cell
@@ -98,6 +98,7 @@ use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     cell::UnsafeCell,
     convert::Infallible,
+    fmt,
     future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
@@ -182,7 +183,6 @@ fn with_lock<T, R>(mutex: &Mutex<T>, f: impl FnOnce(&mut T) -> R) -> R {
 ///
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct OnceCell<T> {
     value: UnsafeCell<MaybeUninit<T>>,
     inner: Inner,
@@ -204,10 +204,22 @@ impl<T: UnwindSafe> UnwindSafe for OnceCell<T> {}
 /// The queue pointer starts out as NULL.  If contention is detected during the initialization of
 /// the object, it is initialized to a Box<Queue>, and will remain pointing at that Queue until the
 /// state has changed to ready with zero active QueueRefs.
-#[derive(Debug)]
 struct Inner {
     state: AtomicUsize,
     queue: AtomicPtr<Queue>,
+}
+
+impl fmt::Debug for Inner {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let state = self.state.load(Ordering::Relaxed);
+        let queue = self.queue.load(Ordering::Relaxed);
+        fmt.debug_struct("Inner")
+            .field("ready", &(state & READY_BIT != 0))
+            .field("quick_init", &(state & QINIT_BIT != 0))
+            .field("refcount", &(state & (QINIT_BIT - 1)))
+            .field("queue", &queue)
+            .finish()
+    }
 }
 
 /// Transient state during initialization
@@ -715,6 +727,13 @@ impl<T> OnceCell<T> {
     }
 }
 
+impl<T: fmt::Debug> fmt::Debug for OnceCell<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let value = self.get();
+        fmt.debug_struct("OnceCell").field("value", &value).field("inner", &self.inner).finish()
+    }
+}
+
 impl<T> Drop for OnceCell<T> {
     fn drop(&mut self) {
         let state = *self.inner.state.get_mut();
@@ -738,7 +757,6 @@ impl<T> From<T> for OnceCell<T> {
     }
 }
 
-#[derive(Debug)]
 enum LazyState<T, F> {
     Running(F),
     Ready(T),
@@ -765,7 +783,6 @@ enum LazyState<T, F> {
 /// assert_eq!(shared.as_ref().get().await.id, 4);
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct Lazy<T, F> {
     value: UnsafeCell<LazyState<T, F>>,
     inner: Inner,
@@ -927,5 +944,12 @@ impl<T, F> Lazy<T, F> {
             LazyState::Ready(v) => Some(v),
             _ => None,
         }
+    }
+}
+
+impl<T: fmt::Debug, F> fmt::Debug for Lazy<T, F> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let value = self.try_get();
+        fmt.debug_struct("Lazy").field("value", &value).field("inner", &self.inner).finish()
     }
 }
