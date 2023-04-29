@@ -19,7 +19,10 @@
 //! # Overhead
 //!
 //! Both cells use two `usize`s to store state and do not retain any allocations after
-//! initialization is complete.  [OnceCell] and [Lazy] only allocate if there is contention.
+//! initialization is complete.  Allocations are only required if there is contention.
+//!
+//! Accessing an already-initialized cell is as cheap as possible: only one atomic load with
+//! Acquire ordering.
 //!
 //! # Features
 //!
@@ -39,6 +42,56 @@
 //!
 //! This is currently a no-op, but might in the future be used to expose APIs that depends on
 //! types only in `std`.  It does *not* control the locking implementation.
+
+// How it works:
+//
+// The basic design goal of async_once_cell is to make the simpler, more common cases as fast and
+// efficient as possible while reverting to a reasonably performant implementation when that's not
+// possible.
+//
+// The fastest path is "access an already-initialized cell": this takes one atomic load with
+// acquire ordering, and doing it with any less is not possible without extreme, platform-specific
+// mechanisms (for example, the membarrier system call on Linux) which would make filling the cell
+// significantly more expensive.
+//
+// The fast path for filling a cell is when there is no contention.  The types in this crate will
+// not allocate in this scenario, which proceeds according to this summary:
+//
+//  1. A single task runs get_or_try_init, which calls Inner::initialize(true)
+//  2. Inner::state transitions from NEW to QINIT_BIT, and a QuickInitGuard is returned
+//  3. The init future is run and completes successfully (possibly after yielding)
+//  4. The value is written to the UnsafeCell
+//  5. Inner::state transitions from QINIT_BIT to READY_BIT during QuickInitGuard's Drop
+//
+// If the init future fails (due to returning an error or a panic), then:
+//  4. The UnsafeCell remains set to None
+//  5. Inner::state transitions from QINIT_BIT to NEW during QuickInitGuard's Drop
+//
+// The fast path does not use Inner::queue at all, and only needs to check it once the cell
+// transitions to the ready state (in order to handle the edge case where a queue was created but
+// was not actually needed).
+//
+// Slow path:
+//
+// If a second task attempts to start initialization, it will not succeed in transitioning
+// Inner::state from NEW to QINIT_BIT.  Instead, it will create a Queue on the heap, storing it in
+// Inner::queue and creating a QueueRef pointing at it.  This Queue will hold the Wakers for all
+// tasks that attempt to perform initialization.  When a QuickInitGuard or QueueHead is dropped,
+// all tasks are woken and will either proceed directly to obtaining a reference (if initialization
+// was successful) or race to create a new QueueHead, with losers re-queuing in a new Waker list.
+//
+// Once a Queue has been created for an Inner, it remains valid as long as either a reference
+// exists (as determined by the reference count in Inner::state) or the state is not ready.  A
+// QueueRef represents one reference to the Queue (similar to how Arc<Queue> would act).
+//
+// The wake-up behavior used here is optimized for the common case where an initialization function
+// succeeds and a mass wake-up results in all woken tasks able to proceed with returning a
+// reference to the just-stored value.  If initialization fails, it would in theory be possible to
+// only wake one of the pending tasks, since only one task will be able to make useful progress by
+// becoming the new QueueHead.  However, to avoid a lost wakeup, this would require tracking wakers
+// and removing them when a QueueRef is dropped.  The extra overhead required to maintain the list
+// of wakers is not worth the extra complexity and locking in the common case where the QueueRef
+// was dropped due to a successful initialization.
 
 #![cfg_attr(feature = "critical-section", no_std)]
 extern crate alloc;
@@ -158,7 +211,14 @@ impl<T> Unpin for OnceCell<T> {}
 impl<T: RefUnwindSafe + UnwindSafe> RefUnwindSafe for OnceCell<T> {}
 impl<T: UnwindSafe> UnwindSafe for OnceCell<T> {}
 
-/// Monomorphic portion of the state
+/// Monomorphic portion of the state of a OnceCell or Lazy.
+///
+/// The top two bits of state are flags (READY_BIT and QINIT_BIT) that define the state of the
+/// cell.  The rest of the bits count the number of QueueRef objects associated with this Inner.
+///
+/// The queue pointer starts out as NULL.  If contention is detected during the initialization of
+/// the object, it is initialized to a Box<Queue>, and will remain pointing at that Queue until the
+/// state has changed to ready with zero active QueueRefs.
 #[derive(Debug)]
 struct Inner {
     state: AtomicUsize,
@@ -175,8 +235,25 @@ struct Queue {
     wakers: Mutex<Option<Vec<task::Waker>>>,
 }
 
-/// This is somewhat like Arc<Queue>, but holds the refcount in Inner instead of Queue so it can be
+/// A reference to the Queue held inside an Inner.
+///
+/// This is somewhat like Arc<Queue>, the refcount is held in Inner instead of Queue so it can be
 /// freed once the cell's initialization is complete.
+///
+/// Holding a QueueRef guarantees that either:
+///  - queue points to a valid Queue that will not be freed until this QueueRef is dropped
+///  - inner.state is ready
+///
+/// The value of QueueRef::queue may be dangling or null if inner.state was ready at the time the
+/// value was loaded.  The holder of a QueueRef must observe a non-ready state prior to using
+/// queue; because this is already done by all holders of QueueRef for other reasons, this second
+/// check is not included in Inner::initialize.
+///
+/// The creation of a QueueRef performs an Acquire ordering operation on Inner::state; its Drop
+/// performs a Release on the same value.
+///
+/// The value of QueuRef::queue may also become dangling during QueueRef's Drop impl even when the
+/// lifetime 'a is still valid, so a raw pointer is required for correctness.
 struct QueueRef<'a> {
     inner: &'a Inner,
     queue: *const Queue,
@@ -185,15 +262,30 @@ struct QueueRef<'a> {
 unsafe impl<'a> Sync for QueueRef<'a> {}
 unsafe impl<'a> Send for QueueRef<'a> {}
 
+/// A write guard for an active initialization of the associated UnsafeCell
+///
+/// This is created on the fast (no-allocation) path only.
 #[derive(Debug)]
-struct QuickInitGuard<'a>(&'a Inner);
+struct QuickInitGuard<'a> {
+    inner: &'a Inner,
+    ready: bool,
+}
 
 /// A Future that waits for acquisition of a QueueHead
 struct QueueWaiter<'a> {
     guard: Option<QueueRef<'a>>,
 }
 
-/// A guard for the actual initialization of the OnceCell
+/// A write guard for the active initialization of the associated UnsafeCell
+///
+/// Creation of a QueueHead must always be done with the Queue's Mutex held.  If no QuickInitGuard
+/// exists, the task creating the QueueHead is the task that transitions the contents of the Mutex
+/// from None to Some; it must verify QINIT_BIT is unset with the lock held.
+///
+/// Only QueueHead::drop may transition the contents of the Mutex from Some to None.
+///
+/// Dropping this object will wake all tasks that have blocked on the currently-running
+/// initialization.
 struct QueueHead<'a> {
     guard: QueueRef<'a>,
 }
@@ -228,7 +320,7 @@ impl Inner {
                 // On success, we know that there were no other QueueRef objects active, and we
                 // just set QINIT_BIT which makes us the only party allowed to create a QueueHead.
                 // This remains true even if the queue is created later.
-                return Err(QuickInitGuard(self));
+                return Err(QuickInitGuard { inner: self, ready: false });
             }
         }
 
@@ -308,40 +400,38 @@ impl<'a> Drop for QueueRef<'a> {
 
 impl<'a> Drop for QuickInitGuard<'a> {
     fn drop(&mut self) {
-        let prev_state = self.0.state.load(Ordering::Relaxed);
-        if prev_state == QINIT_BIT | READY_BIT || prev_state == QINIT_BIT {
-            let target = prev_state & !QINIT_BIT;
-            // Try to finish the fast path of initialization if possible.
-            if self
-                .0
-                .state
-                .compare_exchange(prev_state, target, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                // If init succeeded, the Release in set_ready already ordered the value.  If init
-                // failed, we made no writes that need to be ordered and there are no waiters to
-                // wake, so we can leave the state at NEW.
+        // When our QuickInitGuard was created, Inner::state was changed to QINIT_BIT.  If it is
+        // either unchanged or has changed back to that value, we can finish on the fast path.
+        let fast_target = if self.ready { READY_BIT } else { NEW };
+        if self
+            .inner
+            .state
+            .compare_exchange(QINIT_BIT, fast_target, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Because the exchange succeeded, we know there are no active QueueRefs and so no
+            // wakers need to be woken.  If self.ready is true, the Release ordering pairs with
+            // the Acquire on another thread's access to state to check READY_BIT.
 
-                if target == READY_BIT {
-                    // It's possible (though unlikely) that someone created the queue but abandoned
-                    // their QueueRef before we finished our poll, resulting in us not observing
-                    // them.  No wakes are needed in this case because there are no waiting tasks,
-                    // but we should still clean up the allocation.
-                    let queue = self.0.queue.swap(ptr::null_mut(), Ordering::Relaxed);
-                    if !queue.is_null() {
-                        // Synchronize with both the fetch_sub that lowered the refcount and the
-                        // queue initialization.
-                        core::sync::atomic::fence(Ordering::Acquire);
-                        // Safety: we observed no active QueueRefs, and queue is only used by
-                        // guard-holders.  Due to the swap, we are the only one who is freeing this
-                        // particular queue.
-                        unsafe {
-                            drop(Box::from_raw(queue));
-                        }
+            if self.ready {
+                // It's possible (though unlikely) that someone created the queue but abandoned
+                // their QueueRef before we finished our poll, resulting in us not observing
+                // them.  No wakes are needed in this case because there are no waiting tasks,
+                // but we should still clean up the allocation.
+                let queue = self.inner.queue.swap(ptr::null_mut(), Ordering::Relaxed);
+                if !queue.is_null() {
+                    // Synchronize with both the fetch_sub that lowered the refcount and the
+                    // queue initialization.
+                    core::sync::atomic::fence(Ordering::Acquire);
+                    // Safety: we observed no active QueueRefs, and queue is only used by
+                    // guard-holders.  Due to the swap, we are the only one who is freeing this
+                    // particular queue.
+                    unsafe {
+                        drop(Box::from_raw(queue));
                     }
                 }
-                return;
             }
+            return;
         }
 
         // Slow path: get a guard, create the QueueHead we should have been holding, then drop it
@@ -351,32 +441,42 @@ impl<'a> Drop for QuickInitGuard<'a> {
         //
         // The guard is guaranteed to have been created with no QueueHead available because
         // QINIT_BIT is still set.
-        let waiter = self.0.initialize(false).expect("Got a QuickInitGuard in slow init");
+        let waiter = self.inner.initialize(false).expect("Got a QuickInitGuard in slow init");
         let guard = waiter.guard.expect("No guard available even without polling");
-        if guard.queue.is_null() {
-            // The queue was already freed by someone else before we got our QueueRef (this must
-            // have happened between the load of prev_state and initialize, because otherwise we
-            // would have taken the fast path).  This implies that all other tasks have noticed
-            // READY_BIT and do not need waking, so there is nothing left for us to do except
-            // release our reference.
-            drop(guard);
-        } else {
-            // Safety: the guard holds a place on the waiter list and we just checked that the
-            // queue is non-null.  It will remain valid until guard is dropped.
-            let queue = unsafe { &*guard.queue };
 
-            with_lock(&queue.wakers, |lock| {
-                // Ensure that nobody else can grab the QueueHead between when we release QINIT_BIT
-                // and when our QueueHead is dropped.
-                lock.get_or_insert_with(Vec::new);
-                // Allow someone else to take the head position once we drop it.  Ordering is
-                // handled by the Mutex.
-                self.0.state.fetch_and(!QINIT_BIT, Ordering::Relaxed);
-            });
-
-            // Safety: we just took the head position, and we were the QuickInitGuard
-            drop(QueueHead { guard })
+        // If our initialization was successful, we need to set READY_BIT.  This can't easily be
+        // combined with the other changes to state (incrementing or decrementing the refcount,
+        // clearing QINIT_BIT), so just do it as a separate operation.
+        if self.ready {
+            self.inner.set_ready();
         }
+
+        // Safety: the guard holds a place on the waiter list, and we know READY_BIT was not yet
+        // set when Inner::initialize was called, so the queue must be present.  It will remain
+        // valid until guard is dropped.
+        debug_assert!(!guard.queue.is_null(), "Queue must not be NULL when READY_BIT is not set");
+        let queue = unsafe { &*guard.queue };
+
+        with_lock(&queue.wakers, |lock| {
+            // Creating a QueueHead requires that the Mutex contain Some.  While this is likely
+            // already true, it is not guaranteed because the first concurrent thread might have
+            // been preempted before it was able to start its first QueueWaiter::poll call.  Ensure
+            // that nobody else can grab the QueueHead between when we release QINIT_BIT and when
+            // our QueueHead is dropped.
+            lock.get_or_insert_with(Vec::new);
+
+            // Clear QINIT_BIT, which will allow someone else to take the head position once we
+            // drop it.  Ordering is handled by the Mutex.
+            let prev_state = self.inner.state.fetch_and(!QINIT_BIT, Ordering::Relaxed);
+            debug_assert_eq!(
+                prev_state & QINIT_BIT,
+                QINIT_BIT,
+                "Invalid state: a QuickInitGuard exists without QINIT_BIT set"
+            );
+        });
+
+        // Safety: we just took the head position
+        drop(QueueHead { guard })
     }
 }
 
@@ -410,9 +510,9 @@ impl<'a> Future for QueueWaiter<'a> {
         // not ready, so the queue is non-null and will remain valid until guard is dropped.
         let queue = unsafe { &*guard.queue };
         let rv = with_lock(&queue.wakers, |lock| {
-            // Another task might have called set_ready() and dropped its QueueHead between our
-            // optimistic lock-free check and our lock acquisition.  Don't return a QueueHead unless we
-            // know for sure that we are allowed to initialize.
+            // Another task might have set READY_BIT between our optimistic lock-free check and our
+            // lock acquisition.  Don't return a QueueHead unless we know for sure that we are
+            // allowed to initialize.
             let state = guard.inner.state.load(Ordering::Acquire);
             if state & READY_BIT != 0 {
                 return task::Poll::Ready(None);
@@ -460,14 +560,17 @@ impl<'a> Future for QueueWaiter<'a> {
 
 impl<'a> Drop for QueueHead<'a> {
     fn drop(&mut self) {
-        // Safety: if queue is not null, then it is valid as long as the guard is alive
-        if let Some(queue) = unsafe { self.guard.queue.as_ref() } {
-            // Take the waker queue so the next QueueWaiter can make a new one
-            let wakers = with_lock(&queue.wakers, |w| w.take())
-                .expect("QueueHead dropped without a waker list");
-            for waker in wakers {
-                waker.wake();
-            }
+        // Safety: if queue is not null, then it is valid as long as the guard is alive, and a
+        // QueueHead is never created with a NULL queue (that requires READY_BIT to have been set
+        // inside Inner::initialize, and in that case no QueueHead objects will be created).
+        let queue = unsafe { &*self.guard.queue };
+
+        // Take the waker queue, allowing another QueueHead to be created if READY_BIT is unset.
+        let wakers =
+            with_lock(&queue.wakers, Option::take).expect("QueueHead dropped without a waker list");
+
+        for waker in wakers {
+            waker.wake();
         }
     }
 }
@@ -500,9 +603,11 @@ impl<T> OnceCell<T> {
     /// If the Future returned by this function is dropped prior to completion, the cell remains
     /// uninitialized, and another `init` function will be started (if any are available).
     ///
-    /// It is an error to reentrantly initialize the cell from `init`.  The current implementation
-    /// deadlocks, but will recover if the offending task is dropped or if the future is actually
-    /// able to proceed despite the reentrant call never returning.
+    /// Attempting to reentrantly initialize the cell from `init` will generally cause a deadlock;
+    /// the reentrant call will immediately yield and wait for the pending initialization.  If the
+    /// actual initialization can complete despite this (for example, by polling multiple futures
+    /// and discarding incomplete ones instead of polling them to completion), then the cell will
+    /// successfully be initialized.
     pub async fn get_or_init(&self, init: impl Future<Output = T>) -> &T {
         match self.get_or_try_init(async move { Ok::<T, Infallible>(init.await) }).await {
             Ok(t) => t,
@@ -513,16 +618,22 @@ impl<T> OnceCell<T> {
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.   If the
     /// cell was empty and `init` failed, an error is returned.
     ///
+    /// Many tasks may call `get_or_init` and/or `get_or_try_init` concurrently with different
+    /// initializing futures, but it is guaranteed that only one of the futures will be executed as
+    /// long as the resulting future is polled to completion.
+    ///
     /// If `init` panics or returns an error, the panic or error is propagated to the caller, and
     /// the cell remains uninitialized.  In this case, another `init` function from a concurrent
     /// caller will be selected to execute, if one is available.
     ///
     /// If the Future returned by this function is dropped prior to completion, the cell remains
-    /// uninitialized, and another `init` function will be started.
+    /// uninitialized, and another `init` function will be started (if any are available).
     ///
-    /// It is an error to reentrantly initialize the cell from `init`.  The current implementation
-    /// deadlocks, but will recover if the offending task is dropped or if the future is actually
-    /// able to proceed despite the reentrant call never returning.
+    /// Attempting to reentrantly initialize the cell from `init` will generally cause a deadlock;
+    /// the reentrant call will immediately yield and wait for the pending initialization.  If the
+    /// actual initialization can complete despite this (for example, by polling multiple futures
+    /// and discarding incomplete ones instead of polling them to completion), then the cell will
+    /// successfully be initialized.
     pub async fn get_or_try_init<E>(
         &self,
         init: impl Future<Output = Result<T, E>>,
@@ -544,14 +655,14 @@ impl<T> OnceCell<T> {
         init: impl Future<Output = Result<T, E>>,
     ) -> Result<(), E> {
         match self.inner.initialize(try_quick) {
-            Err(guard) => {
+            Err(mut guard) => {
                 // Try to proceed assuming no contention.
                 let value = init.await?;
                 // Safety: the guard acts like QueueHead even if there is contention.
                 unsafe {
                     *self.value.get() = Some(value);
                 }
-                self.inner.set_ready();
+                guard.ready = true;
                 drop(guard);
             }
             Ok(guard) => {
@@ -690,7 +801,7 @@ where
     #[cold]
     async fn init_slow(self: Pin<&Self>, try_quick: bool) {
         match self.inner.initialize(try_quick) {
-            Err(guard) => {
+            Err(mut guard) => {
                 let init = unsafe {
                     match &mut *self.value.get() {
                         LazyState::Running(f) => Pin::new_unchecked(f),
@@ -703,7 +814,7 @@ where
                 unsafe {
                     *self.value.get() = LazyState::Ready(value);
                 }
-                self.inner.set_ready();
+                guard.ready = true;
                 drop(guard);
             }
             Ok(guard) => {
@@ -726,6 +837,7 @@ where
                     }
                     // mark the cell ready before giving up the head
                     init_lock.guard.inner.set_ready();
+                    drop(init_lock);
                     // drop of QueueHead notifies other Futures
                     // drop of QueueRef (might) free the Queue
                 } else {
