@@ -1,10 +1,10 @@
 //! A collection of lazy initialized values that are created by `Future`s.
 //!
 //! [OnceCell]'s API should be familiar to anyone who has used the
-//! [`once_cell`](https://crates.io/crates/once_cell) crate or the proposed `std::cell::OnceCell`.
-//! It provides an async version of a cell that can only be initialized once, permitting tasks to
-//! wait on the initialization if it is already running instead of racing multiple initialization
-//! tasks.
+//! [`once_cell`](https://crates.io/crates/once_cell) crate, [`std::cell::OnceCell`], or
+//! [`std::sync::OnceLock`].  It provides an async version of a cell that can only be initialized
+//! once, permitting tasks to wait on the initialization if it is already running instead of racing
+//! multiple initialization tasks.
 //!
 //! Unlike threads, tasks can be cancelled at any point where they block.  [OnceCell] deals with
 //! this by allowing another initializer to run if the task currently initializing the cell is
@@ -31,12 +31,6 @@
 //! If this feature is enabled, the [`critical-section`](https://crates.io/crates/critical-section)
 //! crate is used instead of an `std` mutex.  You must depend on that crate and select a locking
 //! implementation; see [its documentation](https://docs.rs/critical-section/) for details.
-//!
-//! ## The `unpin` feature
-//!
-//! This feature enables the `unpin` module which contains an alternative API for [Lazy] that does
-//! not rely on pinning the object during initialization, even for futures that are not [Unpin].
-//! In general, prefer the types in the crate root and, if needed, box futures to make them unpin.
 //!
 //! ## The `std` feature
 //!
@@ -105,6 +99,8 @@ use core::{
     cell::UnsafeCell,
     convert::Infallible,
     future::Future,
+    marker::PhantomData,
+    mem::MaybeUninit,
     panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
     ptr,
@@ -160,18 +156,6 @@ fn with_lock<T, R>(mutex: &Mutex<T>, f: impl FnOnce(&mut T) -> R) -> R {
     f(&mut *mutex.lock().unwrap())
 }
 
-/// Types that do not rely on pinning during initialization.
-///
-/// This module is only built if the `unpin` crate feature is enabled.
-///
-/// This module contains [OnceFuture](unpin::OnceFuture) and its wrappers [Lazy](unpin::Lazy) and
-/// [ConstLazy](unpin::ConstLazy), which provide lazy initialization without requiring the
-/// resulting structure be pinned.
-///
-/// This is the API exposed by the 0.3 version of this crate for `Lazy`.
-#[cfg(feature = "unpin")]
-pub mod unpin;
-
 /// A cell which can be written to only once.
 ///
 /// This allows initialization using an async closure that borrows from its environment.
@@ -200,8 +184,9 @@ pub mod unpin;
 /// ```
 #[derive(Debug)]
 pub struct OnceCell<T> {
-    value: UnsafeCell<Option<T>>,
+    value: UnsafeCell<MaybeUninit<T>>,
     inner: Inner,
+    _marker: PhantomData<T>,
 }
 
 // Safety: our UnsafeCell should be treated like an RwLock<T>
@@ -578,18 +563,20 @@ impl<'a> Drop for QueueHead<'a> {
 impl<T> OnceCell<T> {
     /// Creates a new empty cell.
     pub const fn new() -> Self {
-        Self { value: UnsafeCell::new(None), inner: Inner::new() }
+        Self {
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            inner: Inner::new(),
+            _marker: PhantomData,
+        }
     }
 
     /// Creates a new cell with the given contents.
-    ///
-    /// If value is `None`, this is equivalent to `new()`.
-    pub const fn new_with(value: Option<T>) -> Self {
-        let inner = match value {
-            Some(_) => Inner::new_ready(),
-            None => Inner::new(),
-        };
-        Self { value: UnsafeCell::new(value), inner }
+    pub const fn new_with(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(MaybeUninit::new(value)),
+            inner: Inner::new_ready(),
+            _marker: PhantomData,
+        }
     }
 
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.
@@ -645,7 +632,7 @@ impl<T> OnceCell<T> {
         }
 
         // Safety: initialized on all paths
-        Ok(unsafe { (&*self.value.get()).as_ref().unwrap() })
+        Ok(unsafe { (*self.value.get()).assume_init_ref() })
     }
 
     #[cold]
@@ -660,7 +647,7 @@ impl<T> OnceCell<T> {
                 let value = init.await?;
                 // Safety: the guard acts like QueueHead even if there is contention.
                 unsafe {
-                    *self.value.get() = Some(value);
+                    (*self.value.get()).write(value);
                 }
                 guard.ready = true;
                 drop(guard);
@@ -674,7 +661,7 @@ impl<T> OnceCell<T> {
 
                     // Safety: We still hold the head, so nobody else can write to value
                     unsafe {
-                        *self.value.get() = Some(value);
+                        (*self.value.get()).write(value);
                     }
                     // mark the cell ready before giving up the head
                     init_lock.guard.inner.set_ready();
@@ -697,24 +684,45 @@ impl<T> OnceCell<T> {
         if state & READY_BIT == 0 {
             None
         } else {
-            unsafe { (&*self.value.get()).as_ref() }
+            Some(unsafe { (*self.value.get()).assume_init_ref() })
         }
     }
 
     /// Gets a mutable reference to the underlying value.
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        self.value.get_mut().as_mut()
+        let state = *self.inner.state.get_mut();
+        if state & READY_BIT == 0 {
+            None
+        } else {
+            Some(unsafe { self.value.get_mut().assume_init_mut() })
+        }
     }
 
     /// Takes the value out of this `OnceCell`, moving it back to an uninitialized state.
     pub fn take(&mut self) -> Option<T> {
+        let state = *self.inner.state.get_mut();
         self.inner = Inner::new();
-        self.value.get_mut().take()
+        if state & READY_BIT == 0 {
+            None
+        } else {
+            Some(unsafe { self.value.get_mut().assume_init_read() })
+        }
     }
 
     /// Consumes the OnceCell, returning the wrapped value. Returns None if the cell was empty.
-    pub fn into_inner(self) -> Option<T> {
-        self.value.into_inner()
+    pub fn into_inner(mut self) -> Option<T> {
+        self.take()
+    }
+}
+
+impl<T> Drop for OnceCell<T> {
+    fn drop(&mut self) {
+        let state = *self.inner.state.get_mut();
+        if state & READY_BIT != 0 {
+            unsafe {
+                self.value.get_mut().assume_init_drop();
+            }
+        }
     }
 }
 
@@ -726,7 +734,7 @@ impl<T> Default for OnceCell<T> {
 
 impl<T> From<T> for OnceCell<T> {
     fn from(value: T) -> Self {
-        Self::new_with(Some(value))
+        Self::new_with(value)
     }
 }
 

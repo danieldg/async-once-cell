@@ -1,6 +1,6 @@
 [package]
 name = "async-once-cell"
-version = "0.4.4"
+version = "0.5.0"
 authors = ["Daniel De Graaf <code@danieldg.net>"]
 license = "MIT OR Apache-2.0"
 edition = "2018"
@@ -14,7 +14,6 @@ keywords = ["lazy", "static", "async"]
 categories = ["rust-patterns", "memory-management"]
 
 [features]
-unpin = ['std']
 critical-section = ['dep:critical-section']
 std = []
 

@@ -15,13 +15,4 @@ impl OnceCell<T> {
 }
 ```
 
-More patterns and use-cases are in the [docs](https://docs.rs/async_once_cell/)!
-
-# Related crates
-
-* [once_cell](https://crates.io/crates/once_cell)
-* [double-checked-cell](https://github.com/niklasf/double-checked-cell)
-* [lazy-init](https://crates.io/crates/lazy-init)
-* [lazycell](https://crates.io/crates/lazycell)
-* [mitochondria](https://crates.io/crates/mitochondria)
-* [lazy_static](https://crates.io/crates/lazy_static)
+More patterns and use-cases are in the [docs](https://docs.rs/async-once-cell/)!
