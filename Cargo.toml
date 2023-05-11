@@ -15,6 +15,7 @@ categories = ["rust-patterns", "memory-management"]
 
 [features]
 critical-section = ['dep:critical-section']
+nightly = []
 std = []
 
 [dependencies]

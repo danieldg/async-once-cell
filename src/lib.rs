@@ -36,6 +36,12 @@
 //!
 //! This is currently a no-op, but might in the future be used to expose APIs that depends on
 //! types only in `std`.  It does *not* control the locking implementation.
+//!
+//! ## The `nightly` feature
+//!
+//! This gates features that depend on nightly rustc (as of rustc 1.70).  Currently, this includes
+//! the implementation of `IntoFuture` for `&Lazy<T, F>` and `Pin<&Lazy<T, F>>`, which both require
+//! `#![feature(impl_trait_in_assoc_type)]`.
 
 // How it works:
 //
@@ -87,6 +93,7 @@
 // of wakers is not worth the extra complexity and locking in the common case where the QueueRef
 // was dropped due to a successful initialization.
 
+#![cfg_attr(feature = "nightly", feature(impl_trait_in_assoc_type))]
 #![cfg_attr(feature = "critical-section", no_std)]
 extern crate alloc;
 
@@ -1224,5 +1231,35 @@ impl<T: fmt::Debug, F> fmt::Debug for Lazy<T, F> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let value = self.try_get();
         fmt.debug_struct("Lazy").field("value", &value).field("inner", &self.inner).finish()
+    }
+}
+
+#[cfg(feature = "nightly")]
+impl<'a, T, F> core::future::IntoFuture for &'a Lazy<T, F>
+where
+    F: Future<Output = T> + Unpin,
+{
+    type Output = &'a T;
+
+    type IntoFuture = impl Future<Output = Self::Output>;
+
+    #[inline]
+    fn into_future(self) -> Self::IntoFuture {
+        self.get_unpin()
+    }
+}
+
+#[cfg(feature = "nightly")]
+impl<'a, T, F> core::future::IntoFuture for Pin<&'a Lazy<T, F>>
+where
+    F: Future<Output = T>,
+{
+    type Output = Pin<&'a T>;
+
+    type IntoFuture = impl Future<Output = Self::Output>;
+
+    #[inline]
+    fn into_future(self) -> Self::IntoFuture {
+        self.get()
     }
 }
