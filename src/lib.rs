@@ -1,20 +1,20 @@
 //! A collection of lazy initialized values that are created by `Future`s.
 //!
-//! [OnceCell]'s API should be familiar to anyone who has used the
-//! [`once_cell`](https://crates.io/crates/once_cell) crate, [`std::cell::OnceCell`], or
-//! [`std::sync::OnceLock`].  It provides an async version of a cell that can only be initialized
-//! once, permitting tasks to wait on the initialization if it is already running instead of racing
-//! multiple initialization tasks.
+//! [OnceCell]'s API is similar to the [`once_cell`](https://crates.io/crates/once_cell) crate,
+//! [`std::cell::OnceCell`], or [`std::sync::OnceLock`].  It provides an async version of a cell
+//! that can only be initialized once, permitting tasks to wait on the initialization if it is
+//! already running instead of racing multiple initialization tasks.
 //!
 //! Unlike threads, tasks can be cancelled at any point where they block.  [OnceCell] deals with
 //! this by allowing another initializer to run if the task currently initializing the cell is
-//! dropped.  This also allows for fallible initialization using [OnceCell::get_or_try_init], and
+//! dropped.  This also allows for fallible initialization using [OnceCell::get_or_try_init] and
 //! for the initializing `Future` to contain borrows or use references to thread-local data.
 //!
 //! [Lazy] takes the opposite approach: it wraps a single `Future` which is cooperatively run to
 //! completion by any polling task.  This requires that the initialization function be independent
 //! of the calling context, but will never restart an initializing function just because the
-//! surrounding task was cancelled.
+//! surrounding task was cancelled.  Using a trait object (`Pin<Box<dyn Future>>`) for the future
+//! may simplify using this type in data structures.
 //!
 //! # Overhead
 //!
@@ -101,7 +101,7 @@ use core::{
     fmt,
     future::Future,
     marker::PhantomData,
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
     ptr,
@@ -257,7 +257,7 @@ struct Queue {
 /// The creation of a QueueRef performs an Acquire ordering operation on Inner::state; its Drop
 /// performs a Release on the same value.
 ///
-/// The value of QueuRef::queue may also become dangling during QueueRef's Drop impl even when the
+/// The value of QueueRef::queue may also become dangling during QueueRef's Drop impl even when the
 /// lifetime 'a is still valid, so a raw pointer is required for correctness.
 struct QueueRef<'a> {
     inner: &'a Inner,
@@ -298,6 +298,7 @@ struct QueueHead<'a> {
 const NEW: usize = 0x0;
 const QINIT_BIT: usize = 1 + (usize::MAX >> 2);
 const READY_BIT: usize = 1 + (usize::MAX >> 1);
+const EMPTY_STATE: usize = !0;
 
 impl Inner {
     const fn new() -> Self {
@@ -927,9 +928,10 @@ mod test {
     }
 }
 
-enum LazyState<T, F> {
-    Running(F),
-    Ready(T),
+union LazyState<T, F> {
+    running: ManuallyDrop<F>,
+    ready: ManuallyDrop<T>,
+    _empty: (),
 }
 
 /// A value which is computed on demand by running a future.
@@ -993,50 +995,37 @@ where
         }
 
         // Safety: initialized on all paths, and pinned like self
-        unsafe {
-            match &*self.value.get() {
-                LazyState::Ready(v) => Pin::new_unchecked(v),
-                _ => unreachable!(),
-            }
-        }
+        unsafe { Pin::new_unchecked(&(*self.value.get()).ready) }
     }
 
     #[cold]
     async fn init_slow(self: Pin<&Self>, try_quick: bool) {
         match self.inner.initialize(try_quick) {
             Err(mut guard) => {
-                let init = unsafe {
-                    match &mut *self.value.get() {
-                        LazyState::Running(f) => Pin::new_unchecked(f),
-                        _ => unreachable!(),
-                    }
-                };
+                let init = unsafe { Pin::new_unchecked(&mut *(*self.value.get()).running) };
                 let value = init.await;
                 // Safety: the guard acts like QueueHead even if there is contention.
-                // This overwrites the pinned future, dropping it in place
+                // This transitions the union to ready and updates state to reflect that.
                 unsafe {
-                    *self.value.get() = LazyState::Ready(value);
+                    ManuallyDrop::drop(&mut (*self.value.get()).running);
+                    (*self.value.get()).ready = ManuallyDrop::new(value);
                 }
                 guard.ready = true;
                 drop(guard);
             }
             Ok(guard) => {
                 if let Some(init_lock) = guard.await {
-                    let init = unsafe {
-                        match &mut *self.value.get() {
-                            LazyState::Running(f) => Pin::new_unchecked(f),
-                            _ => unreachable!(),
-                        }
-                    };
+                    let init = unsafe { Pin::new_unchecked(&mut *(*self.value.get()).running) };
                     // We hold the QueueHead, so we know that nobody else has successfully run an init
                     // poll and that nobody else can start until it is dropped.  On error, panic, or
                     // drop of this Future, the head will be passed to another waiter.
                     let value = init.await;
 
                     // Safety: We still hold the head, so nobody else can write to value
-                    // This overwrites the pinned future, dropping it in place
+                    // This transitions the union to ready and updates state to reflect that.
                     unsafe {
-                        *self.value.get() = LazyState::Ready(value);
+                        ManuallyDrop::drop(&mut (*self.value.get()).running);
+                        (*self.value.get()).ready = ManuallyDrop::new(value);
                     }
                     // mark the cell ready before giving up the head
                     init_lock.guard.inner.set_ready();
@@ -1070,12 +1059,18 @@ impl<T, F> Lazy<T, F> {
     ///
     /// This is equivalent to [Self::new] but with no type bound.
     pub const fn from_future(future: F) -> Self {
-        Self { value: UnsafeCell::new(LazyState::Running(future)), inner: Inner::new() }
+        Self {
+            value: UnsafeCell::new(LazyState { running: ManuallyDrop::new(future) }),
+            inner: Inner::new(),
+        }
     }
 
     /// Creates an already-initialized lazy value.
     pub const fn with_value(value: T) -> Self {
-        Self { value: UnsafeCell::new(LazyState::Ready(value)), inner: Inner::new_ready() }
+        Self {
+            value: UnsafeCell::new(LazyState { ready: ManuallyDrop::new(value) }),
+            inner: Inner::new_ready(),
+        }
     }
 
     /// Gets the value without blocking or starting the initialization.
@@ -1085,10 +1080,8 @@ impl<T, F> Lazy<T, F> {
         if state & READY_BIT == 0 {
             None
         } else {
-            match unsafe { &*self.value.get() } {
-                LazyState::Ready(v) => Some(v),
-                _ => unreachable!(),
-            }
+            // Safety: just checked ready
+            unsafe { Some(&(*self.value.get()).ready) }
         }
     }
 
@@ -1097,11 +1090,14 @@ impl<T, F> Lazy<T, F> {
     /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
     /// access and allow violating the usual rules for accessing this cell.
     pub fn try_get_mut(self: Pin<&mut Self>) -> Option<Pin<&mut T>> {
-        unsafe {
-            match self.get_unchecked_mut().value.get_mut() {
-                LazyState::Ready(v) => Some(Pin::new_unchecked(v)),
-                _ => None,
-            }
+        // Safety: unpinning for access
+        let this = unsafe { self.get_unchecked_mut() };
+        let state = *this.inner.state.get_mut();
+        if state & READY_BIT == 0 {
+            None
+        } else {
+            // Safety: just checked ready, and pinned as a projection
+            unsafe { Some(Pin::new_unchecked(&mut this.value.get_mut().ready)) }
         }
     }
 
@@ -1110,17 +1106,48 @@ impl<T, F> Lazy<T, F> {
     /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
     /// access and allow violating the usual rules for accessing this cell.
     pub fn try_get_mut_unpin(&mut self) -> Option<&mut T> {
-        match self.value.get_mut() {
-            LazyState::Ready(v) => Some(v),
-            _ => None,
+        let state = *self.inner.state.get_mut();
+        if state & READY_BIT == 0 {
+            None
+        } else {
+            // Safety: just checked ready
+            unsafe { Some(&mut self.value.get_mut().ready) }
         }
     }
 
     /// Gets the value if it was set.
-    pub fn into_inner(self) -> Option<T> {
-        match self.value.into_inner() {
-            LazyState::Ready(v) => Some(v),
-            _ => None,
+    pub fn into_inner(mut self) -> Option<T> {
+        let state = *self.inner.state.get_mut();
+        if state & READY_BIT == 0 {
+            None
+        } else {
+            // Safety: it was ready, so we can take ownership of the value as long as we avoid
+            // dropping it when self goes out of scope.  The value EMPTY_STATE (!0) is used as a
+            // sentinel to indicate that the union is empty - it's impossible for state to be set
+            // to that value normally by the same logic that prevents refcount overflow.
+            //
+            // Note: it is not safe to do this in a &mut self method because none of the get()
+            // functions handle EMPTY_STATE; that's not relevant here as we took ownership of self.
+            unsafe {
+                *self.inner.state.get_mut() = EMPTY_STATE;
+                Some(ptr::read(&*self.value.get_mut().ready))
+            }
+        }
+    }
+}
+
+impl<T, F> Drop for Lazy<T, F> {
+    fn drop(&mut self) {
+        let state = *self.inner.state.get_mut();
+        // Safety: the state always reflects the variant of the union that we must drop
+        unsafe {
+            if state == EMPTY_STATE {
+                // do nothing (see into_inner and the _empty variant)
+            } else if state & READY_BIT == 0 {
+                ManuallyDrop::drop(&mut self.value.get_mut().running);
+            } else {
+                ManuallyDrop::drop(&mut self.value.get_mut().ready);
+            }
         }
     }
 }
