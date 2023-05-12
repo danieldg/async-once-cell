@@ -791,6 +791,14 @@ mod test {
         }
     }
 
+    impl Drop for CmdWait<'_> {
+        fn drop(&mut self) {
+            if self.0.load(Ordering::Relaxed) == 6 {
+                panic!("Panic on drop");
+            }
+        }
+    }
+
     async fn maybe(cmd: &AtomicUsize, cell: &OnceCell<usize>) -> Result<usize, usize> {
         cell.get_or_try_init(async {
             match dbg!(CmdWait(cmd).await) {
@@ -926,6 +934,26 @@ mod test {
         // no more wakes were sent
         assert_eq!(waker.0.load(Ordering::Relaxed), 2);
     }
+
+    #[test]
+    fn lazy_panic() {
+        let w = Arc::new(CountWaker::default()).into();
+
+        let cmd = AtomicUsize::new(6);
+        let lz = Lazy::new(CmdWait(&cmd));
+
+        assert_eq!(std::mem::size_of_val(&lz), 3 * std::mem::size_of::<usize>(), "Extra overhead?");
+
+        // A panic during F::drop must properly transition the Lazy to ready in order to avoid a
+        // double-drop of F or a drop of an invalid T
+        assert!(std::panic::catch_unwind(|| {
+            let mut cx = std::task::Context::from_waker(&w);
+            pin!(lz.get_unpin()).poll(&mut cx)
+        })
+        .is_err());
+
+        assert_eq!(lz.try_get(), Some(&6));
+    }
 }
 
 union LazyState<T, F> {
@@ -1001,20 +1029,59 @@ where
     #[cold]
     async fn init_slow(self: Pin<&Self>, try_quick: bool) {
         match self.inner.initialize(try_quick) {
-            Err(mut guard) => {
+            Err(guard) => {
+                struct QuickReadyGuard<'a, T, F> {
+                    this: &'a Lazy<T, F>,
+                    value: ManuallyDrop<T>,
+                    guard: QuickInitGuard<'a>,
+                }
+
+                // Prevent double-drop in case of panic in ManuallyDrop::drop
+                impl<T, F> Drop for QuickReadyGuard<'_, T, F> {
+                    fn drop(&mut self) {
+                        // Safety: the union is currently empty and must be filled with a ready value
+                        unsafe {
+                            let value = ManuallyDrop::take(&mut self.value);
+                            (*self.this.value.get()).ready = ManuallyDrop::new(value);
+                        }
+                        self.guard.ready = true;
+                    }
+                }
+
+                // Safety: the union is in the running state and is pinned like self
                 let init = unsafe { Pin::new_unchecked(&mut *(*self.value.get()).running) };
                 let value = init.await;
                 // Safety: the guard acts like QueueHead even if there is contention.
                 // This transitions the union to ready and updates state to reflect that.
                 unsafe {
+                    let guard =
+                        QuickReadyGuard { this: &*self, value: ManuallyDrop::new(value), guard };
                     ManuallyDrop::drop(&mut (*self.value.get()).running);
-                    (*self.value.get()).ready = ManuallyDrop::new(value);
+                    drop(guard);
                 }
-                guard.ready = true;
-                drop(guard);
             }
             Ok(guard) => {
-                if let Some(init_lock) = guard.await {
+                struct ReadyGuard<'a, T, F> {
+                    this: &'a Lazy<T, F>,
+                    value: ManuallyDrop<T>,
+                    // head is a field here to ensure it is dropped after our Drop
+                    head: QueueHead<'a>,
+                }
+
+                // Prevent double-drop in case of panic in ManuallyDrop::drop
+                impl<T, F> Drop for ReadyGuard<'_, T, F> {
+                    fn drop(&mut self) {
+                        // Safety: the union is currently empty and must be filled with a ready value
+                        unsafe {
+                            let value = ManuallyDrop::take(&mut self.value);
+                            (*self.this.value.get()).ready = ManuallyDrop::new(value);
+                        }
+                        self.head.guard.inner.set_ready();
+                    }
+                }
+
+                if let Some(head) = guard.await {
+                    // Safety: the union is in the running state and is pinned like self
                     let init = unsafe { Pin::new_unchecked(&mut *(*self.value.get()).running) };
                     // We hold the QueueHead, so we know that nobody else has successfully run an init
                     // poll and that nobody else can start until it is dropped.  On error, panic, or
@@ -1024,12 +1091,13 @@ where
                     // Safety: We still hold the head, so nobody else can write to value
                     // This transitions the union to ready and updates state to reflect that.
                     unsafe {
+                        let head =
+                            ReadyGuard { this: &*self, value: ManuallyDrop::new(value), head };
                         ManuallyDrop::drop(&mut (*self.value.get()).running);
-                        (*self.value.get()).ready = ManuallyDrop::new(value);
+
+                        // mark the cell ready before giving up the head
+                        drop(head);
                     }
-                    // mark the cell ready before giving up the head
-                    init_lock.guard.inner.set_ready();
-                    drop(init_lock);
                     // drop of QueueHead notifies other Futures
                     // drop of QueueRef (might) free the Queue
                 } else {
