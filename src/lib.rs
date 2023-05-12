@@ -1298,22 +1298,33 @@ impl<T, F> Lazy<T, F> {
         }
     }
 
-    /// Gets the value if it was set.
-    pub fn into_inner(mut self) -> Option<T> {
+    /// Takes ownership of the value if it was set.
+    ///
+    /// Similar to the try_get functions, this returns None if the future has not yet completed,
+    /// even if the value would be available without blocking.
+    pub fn into_inner(self) -> Option<T> {
+        self.into_parts().ok()
+    }
+
+    /// Takes ownership of the value or the initializing future.
+    pub fn into_parts(mut self) -> Result<T, F> {
         let state = *self.inner.state.get_mut();
-        if state & READY_BIT == 0 {
-            None
-        } else {
-            // Safety: it was ready, so we can take ownership of the value as long as we avoid
-            // dropping it when self goes out of scope.  The value EMPTY_STATE (!0) is used as a
-            // sentinel to indicate that the union is empty - it's impossible for state to be set
-            // to that value normally by the same logic that prevents refcount overflow.
-            //
-            // Note: it is not safe to do this in a &mut self method because none of the get()
-            // functions handle EMPTY_STATE; that's not relevant here as we took ownership of self.
-            unsafe {
-                *self.inner.state.get_mut() = EMPTY_STATE;
-                Some(ptr::read(&*self.value.get_mut().ready))
+
+        // Safety: we can take ownership of the contents of self.value as long as we avoid dropping
+        // it when self goes out of scope.  The value EMPTY_STATE (!0) is used as a sentinel to
+        // indicate that the union is empty - it's impossible for state to be set to that value
+        // normally by the same logic that prevents refcount overflow.
+        //
+        // Note: it is not safe to do this in a &mut self method because none of the get()
+        // functions handle EMPTY_STATE; that's not relevant here as we took ownership of self.
+        // A working "Lazy::take(&mut self)" function would also need to create a new initializing
+        // future, and at that point it's best done by just using mem::replace with a new Lazy.
+        unsafe {
+            *self.inner.state.get_mut() = EMPTY_STATE;
+            if state & READY_BIT == 0 {
+                Err(ptr::read(&*self.value.get_mut().running))
+            } else {
+                Ok(ptr::read(&*self.value.get_mut().ready))
             }
         }
     }
