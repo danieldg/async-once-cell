@@ -996,11 +996,12 @@ pub struct Lazy<T, F> {
     inner: Inner,
 }
 
-// Safety: our UnsafeCell should be treated like an RwLock<(T, F)>
-unsafe impl<T: Sync + Send, F: Sync + Send> Sync for Lazy<T, F> {}
+// Safety: our UnsafeCell should be treated like an RwLock<(T, F)>,
+// except that no shared reference to F is ever made available.
+unsafe impl<T: Send + Sync, F: Send> Sync for Lazy<T, F> {}
 unsafe impl<T: Send, F: Send> Send for Lazy<T, F> {}
 impl<T: Unpin, F: Unpin> Unpin for Lazy<T, F> {}
-impl<T: RefUnwindSafe + UnwindSafe, F: RefUnwindSafe + UnwindSafe> RefUnwindSafe for Lazy<T, F> {}
+impl<T: RefUnwindSafe + UnwindSafe, F: UnwindSafe> RefUnwindSafe for Lazy<T, F> {}
 impl<T: UnwindSafe, F: UnwindSafe> UnwindSafe for Lazy<T, F> {}
 
 impl<T, F> Lazy<T, F>
