@@ -1328,6 +1328,27 @@ impl<T, F> Lazy<T, F> {
             }
         }
     }
+
+    /// Takes ownership of the value from a pinned object.
+    ///
+    /// This is equivalent to `mem::replace(self, replacement).into_inner()` but does not require
+    /// that `F` be `Unpin` like that expression would.
+    pub fn replace_and_take(self: Pin<&mut Self>, replacement: Self) -> Option<T>
+    where
+        T: Unpin,
+    {
+        // Safety: this reads fields and then open-codes Pin::set
+        let this = unsafe { self.get_unchecked_mut() };
+        let state = *this.inner.state.get_mut();
+        let value = if state & READY_BIT == 0 {
+            None
+        } else {
+            *this.inner.state.get_mut() = EMPTY_STATE;
+            Some(unsafe { ptr::read(&*this.value.get_mut().ready) })
+        };
+        *this = replacement;
+        value
+    }
 }
 
 impl<T, F> Drop for Lazy<T, F> {
