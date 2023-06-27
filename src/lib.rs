@@ -996,6 +996,55 @@ union LazyState<T, F> {
 /// # let mut cx = std::task::Context::from_waker(&w);
 /// # assert!(std::pin::pin!(run()).poll(&mut cx).is_ready());
 /// ```
+///
+/// Using this type with an `async` block in a `static` item requries unstable rust:
+///
+/// ```no_run
+/// #![feature(const_async_blocks)]
+/// #![feature(type_alias_impl_trait)]
+/// use async_once_cell::Lazy;
+/// use std::future::Future;
+///
+/// type H = impl Future<Output=i32>;
+/// static LAZY: Lazy<i32, H> = Lazy::new(async { 4 });
+/// ```
+///
+/// However, it is possile to use if you have a named struct that implements `Future`:
+///
+/// ```
+/// use async_once_cell::Lazy;
+/// use std::{future::Future, pin::Pin, task};
+///
+/// struct F;
+/// impl Future for F {
+///     type Output = i32;
+///     fn poll(self: Pin<&mut Self>, _: &mut task::Context) -> task::Poll<i32> {
+///         return task::Poll::Ready(4);
+///     }
+/// }
+///
+/// static LAZY: Lazy<i32, F> = Lazy::new(F);
+/// ```
+///
+/// And this type of struct can still use `async` syntax in its implementation:
+///
+/// ```
+/// use async_once_cell::Lazy;
+/// use std::{future::Future, pin::Pin, task};
+///
+/// struct F(Option<Pin<Box<dyn Future<Output=i32> + Sync + Send>>>);
+/// impl Future for F {
+///     type Output = i32;
+///     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> task::Poll<i32> {
+///         Pin::new(self.0.get_or_insert_with(|| Box::pin(async {
+///             4
+///         }))).poll(cx)
+///     }
+/// }
+///
+/// static LAZY: Lazy<i32, F> = Lazy::new(F(None));
+/// ```
+
 pub struct Lazy<T, F> {
     value: UnsafeCell<LazyState<T, F>>,
     inner: Inner,
