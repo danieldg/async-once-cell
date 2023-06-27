@@ -450,13 +450,6 @@ impl<'a> Drop for QuickInitGuard<'a> {
         let waiter = self.inner.initialize(false).expect("Got a QuickInitGuard in slow init");
         let guard = waiter.guard.expect("No guard available even without polling");
 
-        // If our initialization was successful, we need to set READY_BIT.  This can't easily be
-        // combined with the other changes to state (incrementing or decrementing the refcount,
-        // clearing QINIT_BIT), so just do it as a separate operation.
-        if self.ready {
-            self.inner.set_ready();
-        }
-
         // Safety: the guard holds a place on the waiter list, and we know READY_BIT was not yet
         // set when Inner::initialize was called, so the queue must be present.  It will remain
         // valid until guard is dropped.
@@ -471,13 +464,25 @@ impl<'a> Drop for QuickInitGuard<'a> {
             // our QueueHead is dropped.
             lock.get_or_insert_with(Vec::new);
 
-            // Clear QINIT_BIT, which will allow someone else to take the head position once we
-            // drop it.  Ordering is handled by the Mutex.
-            let prev_state = self.inner.state.fetch_and(!QINIT_BIT, Ordering::Relaxed);
+            // We must clear QINIT_BIT, which will allow someone else to take the head position
+            // once we drop it.
+            //
+            // If our initialization was successful, we also need to set READY_BIT.  These
+            // operations can be combined because we know the current state of both bits (only
+            // QINIT_BIT is set) and because READY_BIT == 2 * QINIT_BIT.
+            //
+            // Ordering for QINIT_BIT is handled by the Mutex, but ordering for READY_BIT is not;
+            // it needs Release ordering to ensure that the UnsafeCell's value is visible prior to
+            // that bit being observed as set by other threads.
+            let prev_state = if self.ready {
+                self.inner.state.fetch_add(QINIT_BIT, Ordering::Release)
+            } else {
+                self.inner.state.fetch_sub(QINIT_BIT, Ordering::Relaxed)
+            };
             debug_assert_eq!(
-                prev_state & QINIT_BIT,
+                prev_state & (QINIT_BIT | READY_BIT),
                 QINIT_BIT,
-                "Invalid state: a QuickInitGuard exists without QINIT_BIT set"
+                "Invalid state during QuickInitGuard drop"
             );
         });
 
