@@ -604,6 +604,32 @@ impl<T> OnceCell<T> {
             _marker: PhantomData,
         }
     }
+    /// Gets the contents of the cell, initializing it by calling `f` if the cell was empty.
+    ///
+    /// Many tasks may call `get_or_init` concurrently with different initializing futures, but
+    /// it is guaranteed that only one future will be executed as long as the resulting future is
+    /// polled to completion.
+    ///
+    /// If `init` panics, the panic is propagated to the caller, and the cell remains uninitialized.
+    ///
+    /// If the Future returned by this function is dropped prior to completion, the cell remains
+    /// uninitialized, and another `init` function will be started (if any are available).
+    ///
+    /// Attempting to reentrantly initialize the cell from `f` will generally cause a deadlock;
+    /// the reentrant call will immediately yield and wait for the pending initialization.  If the
+    /// actual initialization can complete despite this (for example, by polling multiple futures
+    /// and discarding incomplete ones instead of polling them to completion), then the cell will
+    /// successfully be initialized.
+    pub async fn get_or_init_with<F, Fut>(&self, f: F) -> &T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>
+    {
+        match self.get_or_try_init_with(|| async move{ Ok::<_, Infallible>(f().await) }).await {
+            Ok(t) => t,
+            Err(e) => match e {},
+        }
+    }
 
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.
     ///
@@ -621,11 +647,45 @@ impl<T> OnceCell<T> {
     /// actual initialization can complete despite this (for example, by polling multiple futures
     /// and discarding incomplete ones instead of polling them to completion), then the cell will
     /// successfully be initialized.
-    pub async fn get_or_init(&self, init: impl Future<Output = T>) -> &T {
-        match self.get_or_try_init(async move { Ok::<T, Infallible>(init.await) }).await {
-            Ok(t) => t,
-            Err(e) => match e {},
+    pub async fn get_or(&self, init: impl Future<Output = T>) -> &T {
+        self.get_or_init_with(|| init).await
+    }
+
+    /// Gets the contents of the cell, initializing it by calling `f` if the cell was empty.  If the
+    /// cell was empty and the call to `f` failed, an error is returned.
+    ///
+    /// Many tasks may call `get_or_init` and/or `get_or_try_init` concurrently with different
+    /// initializing futures, but it is guaranteed that only one of the futures will be executed as
+    /// long as the resulting future is polled to completion.
+    ///
+    /// If `init` panics or returns an error, the panic or error is propagated to the caller, and
+    /// the cell remains uninitialized.  In this case, another `init` function from a concurrent
+    /// caller will be selected to execute, if one is available.
+    ///
+    /// If the Future returned by this function is dropped prior to completion, the cell remains
+    /// uninitialized, and another `init` function will be started (if any are available).
+    ///
+    /// Attempting to reentrantly initialize the cell from `f` will generally cause a deadlock;
+    /// the reentrant call will immediately yield and wait for the pending initialization.  If the
+    /// actual initialization can complete despite this (for example, by polling multiple futures
+    /// and discarding incomplete ones instead of polling them to completion), then the cell will
+    /// successfully be initialized.
+    pub async fn get_or_try_init_with<F, Fut, E>(
+        &self,
+        initf: F,
+    ) -> Result<&T, E> 
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>
+    {
+        let state = self.inner.state.load(Ordering::Acquire);
+
+        if state & READY_BIT == 0 {
+            self.init_slow(state == NEW, initf()).await?;
         }
+
+        // Safety: initialized on all paths
+        Ok(unsafe { (*self.value.get()).assume_init_ref() })
     }
 
     /// Gets the contents of the cell, initializing it with `init` if the cell was empty.   If the
@@ -651,14 +711,7 @@ impl<T> OnceCell<T> {
         &self,
         init: impl Future<Output = Result<T, E>>,
     ) -> Result<&T, E> {
-        let state = self.inner.state.load(Ordering::Acquire);
-
-        if state & READY_BIT == 0 {
-            self.init_slow(state == NEW, init).await?;
-        }
-
-        // Safety: initialized on all paths
-        Ok(unsafe { (*self.value.get()).assume_init_ref() })
+        self.get_or_try_init_with(|| init).await
     }
 
     #[cold]
