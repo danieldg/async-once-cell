@@ -961,9 +961,9 @@ mod test {
     }
 }
 
-union LazyState<T, F> {
+union LazyState<F: Future> {
     running: ManuallyDrop<F>,
-    ready: ManuallyDrop<T>,
+    ready: ManuallyDrop<F::Output>,
     _empty: (),
 }
 
@@ -1006,7 +1006,7 @@ union LazyState<T, F> {
 /// use std::future::Future;
 ///
 /// type H = impl Future<Output=i32>;
-/// static LAZY: Lazy<i32, H> = Lazy::new(async { 4 });
+/// static LAZY: Lazy<H> = Lazy::new(async { 4 });
 /// ```
 ///
 /// However, it is possile to use if you have a named struct that implements `Future`:
@@ -1023,7 +1023,7 @@ union LazyState<T, F> {
 ///     }
 /// }
 ///
-/// static LAZY: Lazy<i32, F> = Lazy::new(F);
+/// static LAZY: Lazy<F> = Lazy::new(F);
 /// ```
 ///
 /// And this type of struct can still use `async` syntax in its implementation:
@@ -1042,25 +1042,22 @@ union LazyState<T, F> {
 ///     }
 /// }
 ///
-/// static LAZY: Lazy<i32, F> = Lazy::new(F(None));
+/// static LAZY: Lazy<F> = Lazy::new(F(None));
 /// ```
 
-pub struct Lazy<T, F> {
-    value: UnsafeCell<LazyState<T, F>>,
+pub struct Lazy<F: Future> {
+    value: UnsafeCell<LazyState<F>>,
     inner: Inner,
 }
 
 // Safety: our UnsafeCell should be treated like (RwLock<T>, Mutex<F>)
-unsafe impl<T: Send + Sync, F: Send> Sync for Lazy<T, F> {}
-unsafe impl<T: Send, F: Send> Send for Lazy<T, F> {}
-impl<T: Unpin, F: Unpin> Unpin for Lazy<T, F> {}
-impl<T: RefUnwindSafe + UnwindSafe, F: UnwindSafe> RefUnwindSafe for Lazy<T, F> {}
-impl<T: UnwindSafe, F: UnwindSafe> UnwindSafe for Lazy<T, F> {}
+unsafe impl<F: Future + Send> Sync for Lazy<F> where F::Output: Send + Sync {}
+unsafe impl<F: Future + Send> Send for Lazy<F> where F::Output: Send + Sync {}
+impl<F: Future + Unpin> Unpin for Lazy<F> where F::Output: Unpin {}
+impl<F: Future + UnwindSafe> RefUnwindSafe for Lazy<F> where F::Output: RefUnwindSafe + UnwindSafe {}
+impl<F: Future + UnwindSafe> UnwindSafe for Lazy<F> where F::Output: UnwindSafe {}
 
-impl<T, F> Lazy<T, F>
-where
-    F: Future<Output = T>,
-{
+impl<F: Future> Lazy<F> {
     /// Creates a new lazy value with the given initializing future.
     pub const fn new(future: F) -> Self {
         Self::from_future(future)
@@ -1071,7 +1068,7 @@ where
     /// This is equivalent to calling `.await` on a pinned reference, but is more explicit.
     ///
     /// The [Pin::static_ref] function may be useful if this is a static value.
-    pub async fn get(self: Pin<&Self>) -> Pin<&T> {
+    pub async fn get(self: Pin<&Self>) -> Pin<&F::Output> {
         self.await
     }
 }
@@ -1086,26 +1083,23 @@ enum Step<'a> {
 /// A helper struct for both of [Lazy]'s [IntoFuture]s
 ///
 /// Note: the Lazy value may or may not be pinned, depending on what public struct wraps this one.
-struct LazyFuture<'a, T, F> {
-    lazy: &'a Lazy<T, F>,
+struct LazyFuture<'a, F: Future> {
+    lazy: &'a Lazy<F>,
     step: Step<'a>,
     // This is needed to guarantee Inner's refcount never overflows
     _pin: PhantomPinned,
 }
 
-impl<'a, T, F> LazyFuture<'a, T, F>
-where
-    F: Future<Output = T>,
-{
-    fn poll(&mut self, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
-        struct QuickReadyGuard<'a, T, F> {
-            this: &'a Lazy<T, F>,
-            value: ManuallyDrop<T>,
+impl<'a, F: Future> LazyFuture<'a, F> {
+    fn poll(&mut self, cx: &mut task::Context<'_>) -> task::Poll<&'a F::Output> {
+        struct QuickReadyGuard<'a, F: Future> {
+            this: &'a Lazy<F>,
+            value: ManuallyDrop<F::Output>,
             guard: QuickInitGuard<'a>,
         }
 
         // Prevent double-drop in case of panic in ManuallyDrop::drop
-        impl<T, F> Drop for QuickReadyGuard<'_, T, F> {
+        impl<F: Future> Drop for QuickReadyGuard<'_, F> {
             fn drop(&mut self) {
                 // Safety: the union is currently empty and must be filled with a ready value
                 unsafe {
@@ -1116,15 +1110,15 @@ where
             }
         }
 
-        struct ReadyGuard<'a, T, F> {
-            this: &'a Lazy<T, F>,
-            value: ManuallyDrop<T>,
+        struct ReadyGuard<'a, F: Future> {
+            this: &'a Lazy<F>,
+            value: ManuallyDrop<F::Output>,
             // head is a field here to ensure it is dropped after our Drop
             head: QueueHead<'a>,
         }
 
         // Prevent double-drop in case of panic in ManuallyDrop::drop
-        impl<T, F> Drop for ReadyGuard<'_, T, F> {
+        impl<F: Future> Drop for ReadyGuard<'_, F> {
             fn drop(&mut self) {
                 // Safety: the union is currently empty and must be filled with a ready value
                 unsafe {
@@ -1223,14 +1217,11 @@ where
 }
 
 /// A helper struct for [Lazy]'s [IntoFuture]
-pub struct LazyFuturePin<'a, T, F>(LazyFuture<'a, T, F>);
+pub struct LazyFuturePin<'a, F: Future>(LazyFuture<'a, F>);
 
-impl<'a, T, F> IntoFuture for Pin<&'a Lazy<T, F>>
-where
-    F: Future<Output = T>,
-{
-    type Output = Pin<&'a T>;
-    type IntoFuture = LazyFuturePin<'a, T, F>;
+impl<'a, F: Future> IntoFuture for Pin<&'a Lazy<F>> {
+    type Output = Pin<&'a F::Output>;
+    type IntoFuture = LazyFuturePin<'a, F>;
     fn into_future(self) -> Self::IntoFuture {
         // Safety: this is Pin::deref, but with a lifetime of 'a
         let lazy = unsafe { Pin::into_inner_unchecked(self) };
@@ -1238,12 +1229,9 @@ where
     }
 }
 
-impl<'a, T, F> Future for LazyFuturePin<'a, T, F>
-where
-    F: Future<Output = T>,
-{
-    type Output = Pin<&'a T>;
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Pin<&'a T>> {
+impl<'a, F: Future> Future for LazyFuturePin<'a, F> {
+    type Output = Pin<&'a F::Output>;
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Pin<&'a F::Output>> {
         // Safety: we don't move anything that needs to be pinned.
         let inner = unsafe { &mut Pin::into_inner_unchecked(self).0 };
         // Safety: because the original Lazy was pinned, the T it produces is also pinned
@@ -1251,47 +1239,38 @@ where
     }
 }
 
-impl<T, F> Lazy<T, F>
-where
-    F: Future<Output = T> + Unpin,
-{
+impl<F: Future + Unpin> Lazy<F> {
     /// Forces the evaluation of this lazy value and returns a reference to the result.
     ///
     /// This is equivalent to calling `.await` on a reference, but may be clearer to call
     /// explicitly.
     ///
     /// Unlike [Self::get], this does not require pinning the object.
-    pub async fn get_unpin(&self) -> &T {
+    pub async fn get_unpin(&self) -> &F::Output {
         self.await
     }
 }
 
 /// A helper struct for [Lazy]'s [IntoFuture]
-pub struct LazyFutureUnpin<'a, T, F>(LazyFuture<'a, T, F>);
+pub struct LazyFutureUnpin<'a, F: Future>(LazyFuture<'a, F>);
 
-impl<'a, T, F> IntoFuture for &'a Lazy<T, F>
-where
-    F: Future<Output = T> + Unpin,
-{
-    type Output = &'a T;
-    type IntoFuture = LazyFutureUnpin<'a, T, F>;
+impl<'a, F: Future + Unpin> IntoFuture for &'a Lazy<F> {
+    type Output = &'a F::Output;
+    type IntoFuture = LazyFutureUnpin<'a, F>;
     fn into_future(self) -> Self::IntoFuture {
         LazyFutureUnpin(LazyFuture { lazy: self, step: Step::Start, _pin: PhantomPinned })
     }
 }
 
-impl<'a, T, F> Future for LazyFutureUnpin<'a, T, F>
-where
-    F: Future<Output = T> + Unpin,
-{
-    type Output = &'a T;
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
+impl<'a, F: Future + Unpin> Future for LazyFutureUnpin<'a, F> {
+    type Output = &'a F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<&'a F::Output> {
         // Safety: we don't move anything that needs to be pinned.
         unsafe { Pin::into_inner_unchecked(self) }.0.poll(cx)
     }
 }
 
-impl<T, F> Lazy<T, F> {
+impl<F: Future> Lazy<F> {
     /// Creates a new lazy value with the given initializing future.
     ///
     /// This is equivalent to [Self::new] but with no type bound.
@@ -1303,7 +1282,7 @@ impl<T, F> Lazy<T, F> {
     }
 
     /// Creates an already-initialized lazy value.
-    pub const fn with_value(value: T) -> Self {
+    pub const fn with_value(value: F::Output) -> Self {
         Self {
             value: UnsafeCell::new(LazyState { ready: ManuallyDrop::new(value) }),
             inner: Inner::new_ready(),
@@ -1311,7 +1290,7 @@ impl<T, F> Lazy<T, F> {
     }
 
     /// Gets the value without blocking or starting the initialization.
-    pub fn try_get(&self) -> Option<&T> {
+    pub fn try_get(&self) -> Option<&F::Output> {
         let state = self.inner.state.load(Ordering::Acquire);
 
         if state & READY_BIT == 0 {
@@ -1326,7 +1305,7 @@ impl<T, F> Lazy<T, F> {
     ///
     /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
     /// access and allow violating the usual rules for accessing this cell.
-    pub fn try_get_mut(self: Pin<&mut Self>) -> Option<Pin<&mut T>> {
+    pub fn try_get_mut(self: Pin<&mut Self>) -> Option<Pin<&mut F::Output>> {
         // Safety: unpinning for access
         let this = unsafe { self.get_unchecked_mut() };
         let state = *this.inner.state.get_mut();
@@ -1342,7 +1321,7 @@ impl<T, F> Lazy<T, F> {
     ///
     /// This requires mutable access to self, so rust's aliasing rules prevent any concurrent
     /// access and allow violating the usual rules for accessing this cell.
-    pub fn try_get_mut_unpin(&mut self) -> Option<&mut T> {
+    pub fn try_get_mut_unpin(&mut self) -> Option<&mut F::Output> {
         let state = *self.inner.state.get_mut();
         if state & READY_BIT == 0 {
             None
@@ -1356,12 +1335,12 @@ impl<T, F> Lazy<T, F> {
     ///
     /// Similar to the try_get functions, this returns None if the future has not yet completed,
     /// even if the value would be available without blocking.
-    pub fn into_inner(self) -> Option<T> {
+    pub fn into_inner(self) -> Option<F::Output> {
         self.into_parts().ok()
     }
 
     /// Takes ownership of the value or the initializing future.
-    pub fn into_parts(mut self) -> Result<T, F> {
+    pub fn into_parts(mut self) -> Result<F::Output, F> {
         let state = *self.inner.state.get_mut();
 
         // Safety: we can take ownership of the contents of self.value as long as we avoid dropping
@@ -1387,9 +1366,9 @@ impl<T, F> Lazy<T, F> {
     ///
     /// This is equivalent to `mem::replace(self, replacement).into_inner()` but does not require
     /// that `F` be `Unpin` like that expression would.
-    pub fn replace_and_take(self: Pin<&mut Self>, replacement: Self) -> Option<T>
+    pub fn replace_and_take(self: Pin<&mut Self>, replacement: Self) -> Option<F::Output>
     where
-        T: Unpin,
+        F::Output: Unpin,
     {
         // Safety: this reads fields and then open-codes Pin::set
         let this = unsafe { self.get_unchecked_mut() };
@@ -1405,7 +1384,7 @@ impl<T, F> Lazy<T, F> {
     }
 }
 
-impl<T, F> Drop for Lazy<T, F> {
+impl<F: Future> Drop for Lazy<F> {
     fn drop(&mut self) {
         let state = *self.inner.state.get_mut();
         // Safety: the state always reflects the variant of the union that we must drop
@@ -1421,7 +1400,10 @@ impl<T, F> Drop for Lazy<T, F> {
     }
 }
 
-impl<T: fmt::Debug, F> fmt::Debug for Lazy<T, F> {
+impl<F: Future> fmt::Debug for Lazy<F>
+where
+    F::Output: fmt::Debug,
+{
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let value = self.try_get();
         fmt.debug_struct("Lazy").field("value", &value).field("inner", &self.inner).finish()
