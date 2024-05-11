@@ -1032,7 +1032,7 @@ union LazyState<T, F> {
 /// use async_once_cell::Lazy;
 /// use std::{future::Future, pin::Pin, task};
 ///
-/// struct F(Option<Pin<Box<dyn Future<Output=i32> + Sync + Send>>>);
+/// struct F(Option<Pin<Box<dyn Future<Output=i32> + Send>>>);
 /// impl Future for F {
 ///     type Output = i32;
 ///     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context) -> task::Poll<i32> {
