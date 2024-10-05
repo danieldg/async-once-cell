@@ -1091,7 +1091,7 @@ union LazyState<T, F> {
 ///
 /// Using this type with an `async` block in a `static` item requries unstable rust:
 ///
-/// ```no_run
+/// ```no_build
 /// #![feature(const_async_blocks)]
 /// #![feature(type_alias_impl_trait)]
 /// mod example {
