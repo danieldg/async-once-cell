@@ -586,6 +586,90 @@ impl<'a> Drop for QueueHead<'a> {
     }
 }
 
+enum Step<'a> {
+    Start { inner: &'a Inner },
+    Quick { guard: QuickInitGuard<'a> },
+    Wait { guard: QueueWaiter<'a> },
+    Run { head: QueueHead<'a> },
+    Done,
+}
+
+enum EitherHead<'a, 'b> {
+    Quick(&'b mut QuickInitGuard<'a>),
+    Normal(&'b QueueHead<'a>),
+}
+
+impl EitherHead<'_, '_> {
+    fn set_ready(&mut self) {
+        match self {
+            Self::Quick(guard) => guard.ready = true,
+            Self::Normal(head) => head.guard.inner.set_ready(),
+        }
+    }
+}
+
+impl<'a> Step<'a> {
+    fn poll<F>(&mut self, cx: &mut task::Context<'_>, mut with_guard: F) -> task::Poll<()>
+    where
+        F: FnMut(&mut task::Context<'_>, EitherHead<'a, '_>) -> task::Poll<()>,
+    {
+        loop {
+            match mem::replace(self, Step::Done) {
+                Step::Start { inner } => {
+                    let state = inner.state.load(Ordering::Acquire);
+                    if state & READY_BIT == 0 {
+                        *self = match inner.initialize(state == NEW) {
+                            Err(guard) => Step::Quick { guard },
+                            Ok(guard) => Step::Wait { guard },
+                        };
+                        continue;
+                    }
+
+                    // Safety: we just saw READY_BIT set
+                    return task::Poll::Ready(());
+                }
+                Step::Quick { mut guard } => {
+                    let rv = with_guard(cx, EitherHead::Quick(&mut guard));
+
+                    if rv.is_pending() {
+                        *self = Step::Quick { guard };
+                    }
+
+                    return rv;
+                }
+                Step::Wait { mut guard } => match Pin::new(&mut guard).poll(cx) {
+                    task::Poll::Pending => {
+                        *self = Step::Wait { guard };
+                        return task::Poll::Pending;
+                    }
+                    task::Poll::Ready(None) => {
+                        // Safety: getting None from QueueWaiter means it is ready
+                        return task::Poll::Ready(());
+                    }
+                    task::Poll::Ready(Some(head)) => {
+                        *self = Step::Run { head };
+                        continue;
+                    }
+                },
+                Step::Run { head } => {
+                    let rv = with_guard(cx, EitherHead::Normal(&head));
+
+                    if rv.is_pending() {
+                        *self = Step::Run { head };
+                    }
+
+                    // drop of QueueHead notifies other Futures
+                    // drop of QueueRef (might) free the Queue
+                    return rv;
+                }
+                Step::Done => {
+                    panic!("Polled future after completion");
+                }
+            }
+        }
+    }
+}
+
 impl<T> OnceCell<T> {
     /// Creates a new empty cell.
     pub const fn new() -> Self {
@@ -1002,11 +1086,12 @@ union LazyState<T, F> {
 /// ```no_run
 /// #![feature(const_async_blocks)]
 /// #![feature(type_alias_impl_trait)]
-/// use async_once_cell::Lazy;
-/// use std::future::Future;
-///
-/// type H = impl Future<Output=i32>;
-/// static LAZY: Lazy<i32, H> = Lazy::new(async { 4 });
+/// mod example {
+///     use async_once_cell::Lazy;
+///     use std::future::Future;
+///     type H = impl Future<Output=i32> + 'static;
+///     static LAZY: Lazy<i32, H> = Lazy::new(async { 4 });
+/// }
 /// ```
 ///
 /// However, it is possile to use if you have a named struct that implements `Future`:
@@ -1076,13 +1161,6 @@ where
     }
 }
 
-enum Step<'a> {
-    Start,
-    Quick { guard: QuickInitGuard<'a> },
-    Wait { guard: QueueWaiter<'a> },
-    Run { head: QueueHead<'a> },
-}
-
 /// A helper struct for both of [Lazy]'s [IntoFuture]s
 ///
 /// Note: the Lazy value may or may not be pinned, depending on what public struct wraps this one.
@@ -1098,127 +1176,50 @@ where
     F: Future<Output = T>,
 {
     fn poll(&mut self, cx: &mut task::Context<'_>) -> task::Poll<&'a T> {
-        struct QuickReadyGuard<'a, T, F> {
+        struct ReplaceGuard<'a, 'b, T, F> {
             this: &'a Lazy<T, F>,
             value: ManuallyDrop<T>,
-            guard: QuickInitGuard<'a>,
+            head: EitherHead<'a, 'b>,
         }
 
         // Prevent double-drop in case of panic in ManuallyDrop::drop
-        impl<T, F> Drop for QuickReadyGuard<'_, T, F> {
+        impl<T, F> Drop for ReplaceGuard<'_, '_, T, F> {
             fn drop(&mut self) {
                 // Safety: the union is currently empty and must be filled with a ready value
                 unsafe {
                     let value = ManuallyDrop::take(&mut self.value);
                     (*self.this.value.get()).ready = ManuallyDrop::new(value);
                 }
-                self.guard.ready = true;
+                self.head.set_ready();
             }
         }
 
-        struct ReadyGuard<'a, T, F> {
-            this: &'a Lazy<T, F>,
-            value: ManuallyDrop<T>,
-            // head is a field here to ensure it is dropped after our Drop
-            head: QueueHead<'a>,
-        }
+        let this = &self.lazy;
+        self.step
+            .poll(cx, |cx, head| {
+                // Safety: this closure is only called when we have the queue head, so the
+                // union is in the running state and is pinned like self
+                let init = unsafe { Pin::new_unchecked(&mut *(*this.value.get()).running) };
 
-        // Prevent double-drop in case of panic in ManuallyDrop::drop
-        impl<T, F> Drop for ReadyGuard<'_, T, F> {
-            fn drop(&mut self) {
-                // Safety: the union is currently empty and must be filled with a ready value
+                let value = ManuallyDrop::new(task::ready!(init.poll(cx)));
+
+                // Safety: the guard will cause the replace and set-ready operations to happen
+                // even if the future panics on drop, so the union will not be vacant even on
+                // unwind.
                 unsafe {
-                    let value = ManuallyDrop::take(&mut self.value);
-                    (*self.this.value.get()).ready = ManuallyDrop::new(value);
+                    let guard = ReplaceGuard { this, value, head };
+                    ManuallyDrop::drop(&mut (*this.value.get()).running);
+                    drop(guard);
                 }
-                self.head.guard.inner.set_ready();
-            }
-        }
 
-        loop {
-            match mem::replace(&mut self.step, Step::Start) {
-                Step::Start => {
-                    let state = self.lazy.inner.state.load(Ordering::Acquire);
-
-                    if state & READY_BIT == 0 {
-                        self.step = match self.lazy.inner.initialize(state == NEW) {
-                            Err(guard) => Step::Quick { guard },
-                            Ok(guard) => Step::Wait { guard },
-                        };
-                        continue;
-                    }
-
-                    // Safety: we just saw READY_BIT set
-                    return task::Poll::Ready(unsafe { &(*self.lazy.value.get()).ready });
-                }
-                Step::Quick { guard } => {
-                    // Safety: the union is in the running state and is pinned like self
-                    let init =
-                        unsafe { Pin::new_unchecked(&mut *(*self.lazy.value.get()).running) };
-                    let value = match init.poll(cx) {
-                        task::Poll::Pending => {
-                            self.step = Step::Quick { guard };
-                            return task::Poll::Pending;
-                        }
-                        task::Poll::Ready(value) => ManuallyDrop::new(value),
-                    };
-                    // Safety: the guard acts like QueueHead even if there is contention.
-                    // This transitions the union to ready and updates state to reflect that.
-                    unsafe {
-                        let guard = QuickReadyGuard { this: &self.lazy, value, guard };
-                        ManuallyDrop::drop(&mut (*self.lazy.value.get()).running);
-                        drop(guard);
-                    }
-
-                    // Safety: just initialized
-                    return task::Poll::Ready(unsafe { &(*self.lazy.value.get()).ready });
-                }
-                Step::Wait { mut guard } => match Pin::new(&mut guard).poll(cx) {
-                    task::Poll::Pending => {
-                        self.step = Step::Wait { guard };
-                        return task::Poll::Pending;
-                    }
-                    task::Poll::Ready(None) => {
-                        // Safety: getting None from QueueWaiter means it is ready
-                        return task::Poll::Ready(unsafe { &(*self.lazy.value.get()).ready });
-                    }
-                    task::Poll::Ready(Some(head)) => {
-                        self.step = Step::Run { head };
-                        continue;
-                    }
-                },
-                Step::Run { head } => {
-                    // Safety: the union is in the running state and is pinned like self
-                    let init =
-                        unsafe { Pin::new_unchecked(&mut *(*self.lazy.value.get()).running) };
-                    // We hold the QueueHead, so we know that nobody else has successfully run an init
-                    // poll and that nobody else can start until it is dropped.  On error, panic, or
-                    // drop of this Future, the head will be passed to another waiter.
-                    let value = match init.poll(cx) {
-                        task::Poll::Pending => {
-                            self.step = Step::Run { head };
-                            return task::Poll::Pending;
-                        }
-                        task::Poll::Ready(value) => ManuallyDrop::new(value),
-                    };
-
-                    // Safety: We still hold the head, so nobody else can write to value
-                    // This transitions the union to ready and updates state to reflect that.
-                    unsafe {
-                        let head = ReadyGuard { this: &self.lazy, value, head };
-                        ManuallyDrop::drop(&mut (*self.lazy.value.get()).running);
-
-                        // mark the cell ready before giving up the head
-                        drop(head);
-                    }
-                    // drop of QueueHead notifies other Futures
-                    // drop of QueueRef (might) free the Queue
-
-                    // Safety: just initialized
-                    return task::Poll::Ready(unsafe { &(*self.lazy.value.get()).ready });
-                }
-            }
-        }
+                // Safety: just initialized
+                task::Poll::Ready(())
+            })
+            .map(|()| {
+                // Safety: Ready is only returned when either READY_BIT was seen or we returned Ready
+                // from our closure
+                unsafe { &*(*this.value.get()).ready }
+            })
     }
 }
 
@@ -1234,7 +1235,11 @@ where
     fn into_future(self) -> Self::IntoFuture {
         // Safety: this is Pin::deref, but with a lifetime of 'a
         let lazy = unsafe { Pin::into_inner_unchecked(self) };
-        LazyFuturePin(LazyFuture { lazy, step: Step::Start, _pin: PhantomPinned })
+        LazyFuturePin(LazyFuture {
+            lazy,
+            step: Step::Start { inner: &lazy.inner },
+            _pin: PhantomPinned,
+        })
     }
 }
 
@@ -1276,7 +1281,11 @@ where
     type Output = &'a T;
     type IntoFuture = LazyFutureUnpin<'a, T, F>;
     fn into_future(self) -> Self::IntoFuture {
-        LazyFutureUnpin(LazyFuture { lazy: self, step: Step::Start, _pin: PhantomPinned })
+        LazyFutureUnpin(LazyFuture {
+            lazy: self,
+            step: Step::Start { inner: &self.inner },
+            _pin: PhantomPinned,
+        })
     }
 }
 
