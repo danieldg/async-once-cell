@@ -103,7 +103,7 @@ use core::{
     marker::{PhantomData, PhantomPinned},
     mem::{self, ManuallyDrop, MaybeUninit},
     panic::{RefUnwindSafe, UnwindSafe},
-    pin::Pin,
+    pin::{pin, Pin},
     ptr,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
     task,
@@ -609,9 +609,15 @@ impl EitherHead<'_, '_> {
 }
 
 impl<'a> Step<'a> {
-    fn poll<F>(&mut self, cx: &mut task::Context<'_>, mut with_guard: F) -> task::Poll<()>
+    /// Run one step the state machine.
+    ///
+    /// - The provided `done` value will only be returned only if READY_BIT is observed
+    /// - The `init` closure will be run when the initialization lock is acquired.  It should call
+    /// [EitherHead::set_ready] in order to set READY_BIT if it succeeds; this will cause tasks
+    /// that are waiting on initialization to wake up.
+    fn poll_init<F, R>(&mut self, cx: &mut task::Context<'_>, done: R, mut init: F) -> task::Poll<R>
     where
-        F: FnMut(&mut task::Context<'_>, EitherHead<'a, '_>) -> task::Poll<()>,
+        F: FnMut(&mut task::Context<'_>, EitherHead<'a, '_>) -> task::Poll<R>,
     {
         loop {
             match mem::replace(self, Step::Done) {
@@ -626,10 +632,10 @@ impl<'a> Step<'a> {
                     }
 
                     // Safety: we just saw READY_BIT set
-                    return task::Poll::Ready(());
+                    return task::Poll::Ready(done);
                 }
                 Step::Quick { mut guard } => {
-                    let rv = with_guard(cx, EitherHead::Quick(&mut guard));
+                    let rv = init(cx, EitherHead::Quick(&mut guard));
 
                     if rv.is_pending() {
                         *self = Step::Quick { guard };
@@ -644,7 +650,7 @@ impl<'a> Step<'a> {
                     }
                     task::Poll::Ready(None) => {
                         // Safety: getting None from QueueWaiter means it is ready
-                        return task::Poll::Ready(());
+                        return task::Poll::Ready(done);
                     }
                     task::Poll::Ready(Some(head)) => {
                         *self = Step::Run { head };
@@ -652,7 +658,7 @@ impl<'a> Step<'a> {
                     }
                 },
                 Step::Run { head } => {
-                    let rv = with_guard(cx, EitherHead::Normal(&head));
+                    let rv = init(cx, EitherHead::Normal(&head));
 
                     if rv.is_pending() {
                         *self = Step::Run { head };
@@ -667,6 +673,51 @@ impl<'a> Step<'a> {
                 }
             }
         }
+    }
+}
+
+struct InitFuture<'a, T, F> {
+    cell: &'a OnceCell<T>,
+    init: F,
+    step: Step<'a>,
+}
+
+impl<'a, T, F> InitFuture<'a, T, F> {
+    fn new<R>(cell: &'a OnceCell<T>, init: F) -> Self
+    where
+        F: for<'c> FnMut(&mut task::Context<'c>) -> task::Poll<R> + Unpin,
+    {
+        Self { cell, init, step: Step::Start { inner: &cell.inner } }
+    }
+}
+
+impl<'a, T, F, E> Future for InitFuture<'a, T, F>
+where
+    F: for<'c> FnMut(&mut task::Context<'c>) -> task::Poll<Result<T, E>> + Unpin,
+{
+    type Output = Result<&'a T, E>;
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+        struct Filled;
+        let this = self.get_mut();
+        let cell = this.cell;
+        let init = &mut this.init;
+        this.step
+            .poll_init(cx, Ok(Filled), |cx, mut head| {
+                let value = task::ready!(init(cx))?;
+
+                // Safety: We hold the head, so nobody else can write to value
+                unsafe {
+                    (*cell.value.get()).write(value);
+                }
+                head.set_ready();
+
+                task::Poll::Ready(Ok(Filled))
+            })
+            .map(|r| {
+                // Safety: a Filled struct is only returned when either READY_BIT was seen or when
+                // we wrote the value.
+                r.map(|Filled| unsafe { (*this.cell.value.get()).assume_init_ref() })
+            })
     }
 }
 
@@ -706,7 +757,9 @@ impl<T> OnceCell<T> {
     /// and discarding incomplete ones instead of polling them to completion), then the cell will
     /// successfully be initialized.
     pub async fn get_or_init(&self, init: impl Future<Output = T>) -> &T {
-        match self.get_or_try_init(async move { Ok::<T, Infallible>(init.await) }).await {
+        let mut init = pin!(init);
+        // TODO replace this match to Result::into_ok when that is stabilized
+        match InitFuture::new(self, |cx| init.as_mut().poll(cx).map(Ok::<T, Infallible>)).await {
             Ok(t) => t,
             Err(e) => match e {},
         }
@@ -735,54 +788,9 @@ impl<T> OnceCell<T> {
         &self,
         init: impl Future<Output = Result<T, E>>,
     ) -> Result<&T, E> {
-        let state = self.inner.state.load(Ordering::Acquire);
+        let mut init = pin!(init);
 
-        if state & READY_BIT == 0 {
-            self.init_slow(state == NEW, init).await?;
-        }
-
-        // Safety: initialized on all paths
-        Ok(unsafe { (*self.value.get()).assume_init_ref() })
-    }
-
-    #[cold]
-    async fn init_slow<E>(
-        &self,
-        try_quick: bool,
-        init: impl Future<Output = Result<T, E>>,
-    ) -> Result<(), E> {
-        match self.inner.initialize(try_quick) {
-            Err(mut guard) => {
-                // Try to proceed assuming no contention.
-                let value = init.await?;
-                // Safety: the guard acts like QueueHead even if there is contention.
-                unsafe {
-                    (*self.value.get()).write(value);
-                }
-                guard.ready = true;
-                drop(guard);
-            }
-            Ok(guard) => {
-                if let Some(init_lock) = guard.await {
-                    // We hold the QueueHead, so we know that nobody else has successfully run an init
-                    // poll and that nobody else can start until it is dropped.  On error, panic, or
-                    // drop of this Future, the head will be passed to another waiter.
-                    let value = init.await?;
-
-                    // Safety: We still hold the head, so nobody else can write to value
-                    unsafe {
-                        (*self.value.get()).write(value);
-                    }
-                    // mark the cell ready before giving up the head
-                    init_lock.guard.inner.set_ready();
-                    // drop of QueueHead notifies other Futures
-                    // drop of QueueRef (might) free the Queue
-                } else {
-                    // someone initialized it while waiting on the queue
-                }
-            }
-        }
-        Ok(())
+        InitFuture::new(self, |cx| init.as_mut().poll(cx)).await
     }
 
     /// Gets the reference to the underlying value.
@@ -1196,7 +1204,7 @@ where
 
         let this = &self.lazy;
         self.step
-            .poll(cx, |cx, head| {
+            .poll_init(cx, (), |cx, head| {
                 // Safety: this closure is only called when we have the queue head, so the
                 // union is in the running state and is pinned like self
                 let init = unsafe { Pin::new_unchecked(&mut *(*this.value.get()).running) };
